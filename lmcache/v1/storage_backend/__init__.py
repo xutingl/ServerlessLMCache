@@ -18,6 +18,7 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 from lmcache.v1.storage_backend.p2p_backend import P2PBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+from lmcache.v1.storage_backend.shared_disk_backend import SharedDiskBackend
 
 if TYPE_CHECKING:
     # First Party
@@ -130,7 +131,16 @@ def CreateStorageBackends(
         "enable_nixl_storage"
     )
 
-    if config.enable_pd:
+    # Check for shared disk backend (disk-based disaggregated PD)
+    enable_shared_disk = (
+        extra_config is not None and extra_config.get("enable_shared_disk", False)
+    ) or getattr(config, "enable_shared_disk", False)
+    
+    if enable_shared_disk:
+        storage_backends["SharedDiskBackend"] = SharedDiskBackend(config, metadata)
+        logger.info("SharedDiskBackend enabled for disk-based disaggregated PD")
+    elif config.enable_pd:
+        # Use NIXL-based PDBackend for network transfer
         # First Party
         from lmcache.v1.storage_backend.pd_backend import PDBackend
 

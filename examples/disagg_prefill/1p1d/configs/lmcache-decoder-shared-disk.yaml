@@ -1,0 +1,34 @@
+# LMCache configuration for Decoder with SharedDiskBackend
+# This enables disk-based pipelined KV cache transfer for disaggregated prefill-decode
+
+# Disable local CPU storage (we use shared disk instead)
+local_cpu: False
+
+# Enable layer-wise pipelining for better overlap with computation
+use_layerwise: True
+
+# Enable PD (prefill-decode) disaggregation
+enable_pd: True
+
+# SharedDiskBackend configuration
+enable_shared_disk: True
+shared_disk_path: "/tmp/lmcache_shared_kv"
+shared_disk_type: "local_disk"  # Options: local_disk, gcs, s3
+
+# Role configuration (receiver = decoder)
+pd_role: "receiver"
+
+# Buffer configuration
+pd_buffer_size: 2147483648  # 2GB
+pd_buffer_device: "cuda"
+
+# Peer configuration (listen for notifications from prefiller)
+pd_peer_host: "localhost"
+pd_peer_init_port: [7300]  # Per-TP-rank ports
+
+# Enable saving decode cache for potential task migration
+save_decode_cache: True
+
+# Extra configuration
+extra_config:
+  use_odirect: False  # Set to True for O_DIRECT I/O (requires aligned buffers)
