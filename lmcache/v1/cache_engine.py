@@ -716,6 +716,7 @@ class LMCacheEngine:
             assert_layerwise_gpu_connector(self.gpu_connector)
 
             t_start = time.perf_counter()
+            io_time = 0.0
             mem_obj_generator = self.gpu_connector.batched_from_gpu(
                 memory_objs, starts, ends, **kwargs
             )
@@ -724,21 +725,27 @@ class LMCacheEngine:
 
             for layer_id in range(self.num_layers):
                 yield
+                t_io = time.perf_counter()
                 next(mem_obj_generator)
                 self.storage_manager.batched_put(
                     keys[layer_id], memory_objs[layer_id], location=self.store_location
                 )
+                io_time += time.perf_counter() - t_io
 
-            tot_time = time.perf_counter() - t_start
+            wall_time = time.perf_counter() - t_start
             logger.info(
                 "[req_id=%s] Stored %d out of total %d tokens. "
-                "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
+                "size: %.4f GB, cost %.4f ms, "
+                "io_time %.4f ms, wall_time %.4f ms, "
+                "throughput: %.4f GB/s",
                 req_id,
                 tot_token_num,
                 len(tokens),
                 tot_kv_size / 1024**3,
-                tot_time * 1000,
-                tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
+                io_time * 1000,
+                io_time * 1000,
+                wall_time * 1000,
+                tot_kv_size / io_time / 1024**3 if io_time > 0 else 0,
             )
         else:
             # If no cache are found, we still need to yield to avoid
@@ -1003,9 +1010,15 @@ class LMCacheEngine:
             mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
             next(mem_obj_consumer)
 
+            t_start = time.perf_counter()
+            io_time = 0.0
+            tot_kv_size = 0
+
             to_count_down = []
             for layer_id in range(self.num_layers):
+                t_io = time.perf_counter()
                 task = next(get_generator)
+                io_time += time.perf_counter() - t_io
 
                 assert task is not None
 
@@ -1016,13 +1029,20 @@ class LMCacheEngine:
                 else:
                     yield None
 
+                t_io = time.perf_counter()
                 mem_objs_layer = task.result()
                 mem_obj_consumer.send(mem_objs_layer)
+                io_time += time.perf_counter() - t_io
+                for mo in mem_objs_layer:
+                    tot_kv_size += mo.get_size()
                 to_count_down.extend(mem_objs_layer)
 
             for mem_obj in to_count_down:
                 mem_obj.ref_count_down()
         else:
+            t_start = time.perf_counter()
+            io_time = 0.0
+            tot_kv_size = 0
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
             for layer_id in range(self.num_layers):
@@ -1041,15 +1061,23 @@ class LMCacheEngine:
             if mem_obj.is_pinned:
                 mem_obj.unpin()
 
+        wall_time = time.perf_counter() - t_start
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
         if not self._is_passive():
             logger.info(
-                "[req_id=%s] Retrieved %d out of %d out of total %d tokens",
+                "[req_id=%s] Retrieved %d out of %d required tokens "
+                "(from %d total tokens). size: %.4f GB, "
+                "io_time %.4f ms, wall_time %.4f ms, "
+                "throughput: %.4f GB/s",
                 req_id,
                 retrieved_tokens,
                 num_required_tokens,
                 len(tokens),
+                tot_kv_size / 1024**3,
+                io_time * 1000,
+                wall_time * 1000,
+                tot_kv_size / io_time / 1024**3 if io_time > 0 else 0,
             )
 
         yield ret_mask
