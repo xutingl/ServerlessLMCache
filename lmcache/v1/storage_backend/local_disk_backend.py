@@ -3,6 +3,7 @@
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
+import json
 import os
 import threading
 import time
@@ -13,7 +14,14 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    DiskCacheMetadata,
+    LayerCacheEngineKey,
+    STR_DTYPE_TO_TORCH_DTYPE,
+    TORCH_DTYPE_TO_STR_DTYPE,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
@@ -168,6 +176,9 @@ class LocalDiskBackend(StorageBackendInterface):
         else:
             logger.warning("Controller message sender is not initialized")
 
+        # Discover KV cache entries written by other processes
+        self._scan_existing_files()
+
     def __str__(self) -> str:
         return "LocalDiskBackend"
 
@@ -177,10 +188,98 @@ class LocalDiskBackend(StorageBackendInterface):
     ) -> str:
         return os.path.join(self.path, key.to_string().replace("/", "-") + ".pt")
 
+    @staticmethod
+    def _meta_path_for(pt_path: str) -> str:
+        """Return the sidecar metadata path for a given .pt data file."""
+        return pt_path[:-3] + ".meta"
+
+    @staticmethod
+    def _save_metadata(pt_path: str, size: int, shape: torch.Size,
+                       dtype: torch.dtype, fmt: MemoryFormat) -> None:
+        """Write a JSON sidecar with shape/dtype/fmt so other processes
+        can discover this entry by scanning the disk directory."""
+        meta = {
+            "size": size,
+            "shape": list(shape),
+            "dtype": TORCH_DTYPE_TO_STR_DTYPE[dtype],
+            "fmt": fmt.value,
+        }
+        meta_path = LocalDiskBackend._meta_path_for(pt_path)
+        with open(meta_path, "w") as f:
+            json.dump(meta, f)
+
+    def _scan_existing_files(self) -> None:
+        """Populate self.dict from .meta sidecar files already on disk.
+
+        This enables cross-process KV cache sharing: if Instance A stored
+        KV cache chunks to the shared disk directory, Instance B can
+        discover and load them on startup."""
+        count = 0
+        try:
+            for entry in os.scandir(self.path):
+                if not entry.name.endswith(".meta") or not entry.is_file():
+                    continue
+                pt_path = entry.path[:-5] + ".pt"
+                if not os.path.isfile(pt_path):
+                    continue
+                try:
+                    with open(entry.path, "r") as f:
+                        meta = json.load(f)
+                    # Parse the key from the .pt filename
+                    key_str = os.path.basename(pt_path)[:-3].replace("-", "/")
+                    parts = key_str.split("@")
+                    if len(parts) >= 6:
+                        key = LayerCacheEngineKey.from_string(key_str)
+                    else:
+                        key = CacheEngineKey.from_string(key_str)
+                    shape = torch.Size(meta["shape"])
+                    dtype = STR_DTYPE_TO_TORCH_DTYPE[meta["dtype"]]
+                    fmt = MemoryFormat(meta["fmt"])
+                    size = meta["size"]
+                    self.dict[key] = DiskCacheMetadata(
+                        pt_path, size, shape, dtype, None, fmt, 0
+                    )
+                    self.current_cache_size += size
+                    count += 1
+                except Exception as e:
+                    logger.debug(f"Skipping {entry.name}: {e}")
+        except OSError as e:
+            logger.warning(f"Failed to scan disk directory: {e}")
+        if count > 0:
+            logger.info(f"Discovered {count} existing cache entries on disk")
+
+    def _try_discover_on_disk(self, key: CacheEngineKey) -> bool:
+        """Check if a .pt + .meta file pair exists on disk for *key*.
+
+        If found, load the metadata and register it in self.dict so
+        subsequent lookups are fast.  Must be called with disk_lock held.
+        """
+        pt_path = self._key_to_path(key)
+        meta_path = self._meta_path_for(pt_path)
+        if not os.path.isfile(pt_path) or not os.path.isfile(meta_path):
+            return False
+        try:
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            shape = torch.Size(meta["shape"])
+            dtype = STR_DTYPE_TO_TORCH_DTYPE[meta["dtype"]]
+            fmt = MemoryFormat(meta["fmt"])
+            size = meta["size"]
+            self.dict[key] = DiskCacheMetadata(
+                pt_path, size, shape, dtype, None, fmt, 0
+            )
+            self.current_cache_size += size
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to discover {key} on disk: {e}")
+            return False
+
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.disk_lock:
             if key not in self.dict:
-                return False
+                # Fallback: check if another process stored this key to disk
+                if not self._try_discover_on_disk(key):
+                    return False
             if pin:
                 self.dict[key].pin()
                 # vllm lookup sets pin to True
@@ -245,6 +344,10 @@ class LocalDiskBackend(StorageBackendInterface):
         # res.result()
 
         os.remove(path)
+        # Remove sidecar metadata file if present
+        meta_path = self._meta_path_for(path)
+        if os.path.exists(meta_path):
+            os.remove(meta_path)
 
         if force:
             self.cache_policy.update_on_force_evict(key)
@@ -478,7 +581,9 @@ class LocalDiskBackend(StorageBackendInterface):
         with self.disk_lock:
             for key in keys:
                 if key not in self.dict:
-                    return num_hit_counts
+                    # Fallback: check if another process stored this key
+                    if not self._try_discover_on_disk(key):
+                        return num_hit_counts
                 if pin:
                     self.dict[key].pin()
                     self.keys_in_request.append(key)
@@ -526,6 +631,13 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_obj.ref_count_down()
 
         self.insert_key(key, size, shape, dtype, fmt, cached_positions=cached_positions)
+
+        # Write sidecar metadata for cross-process cache discovery
+        pt_path = self._key_to_path(key)
+        try:
+            self._save_metadata(pt_path, size, shape, dtype, fmt)
+        except Exception as e:
+            logger.debug(f"Failed to write metadata sidecar for {key}: {e}")
 
         self.disk_worker.remove_put_task(key)
 
