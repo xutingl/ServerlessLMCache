@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
@@ -513,6 +514,11 @@ class LMCacheConnectorV1Impl:
         self._layerwise_save_storers: dict[
             str, Generator[Optional[torch.Tensor], None, None]
         ] = {}
+        self._layerwise_save_executor: Optional[ThreadPoolExecutor] = None
+        self._layerwise_save_dependency_stream: Optional[
+            torch.cuda.Stream
+        ] = None
+        self._layerwise_save_futures: dict[str, list[Future[None]]] = {}
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
 
         # Role-specific initialization
@@ -521,6 +527,14 @@ class LMCacheConnectorV1Impl:
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
+
+            if self.use_layerwise:
+                self._layerwise_save_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="lmcache-layer-save"
+                )
+                self._layerwise_save_dependency_stream = torch.cuda.Stream(
+                    device=self.device
+                )
 
             if self.enable_blending:
                 assert self.lmcache_engine is not None
@@ -975,6 +989,21 @@ class LMCacheConnectorV1Impl:
         return
 
     @_lmcache_nvtx_annotate
+    def _advance_layerwise_storer(
+        self,
+        layerwise_storer: Generator[Optional[torch.Tensor], None, None],
+        ready_event: Optional[torch.cuda.Event],
+    ) -> None:
+        dependency_stream = self._layerwise_save_dependency_stream
+        assert dependency_stream is not None
+
+        with torch.cuda.device(self.device):
+            with torch.cuda.stream(dependency_stream):
+                if ready_event is not None:
+                    dependency_stream.wait_event(ready_event)
+                next(layerwise_storer)
+
+    @_lmcache_nvtx_annotate
     def save_kv_layer(
         self,
         layer_name: str,
@@ -1012,6 +1041,7 @@ class LMCacheConnectorV1Impl:
 
         kvcaches = list(self.kv_caches.values())
         is_first = True
+        ready_event: Optional[torch.cuda.Event] = None
 
         for request in connector_metadata.requests:
             save_spec = request.save_spec
@@ -1074,7 +1104,20 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
-            next(layerwise_storer)
+            if ready_event is None:
+                ready_event = torch.cuda.Event()
+                ready_event.record(torch.cuda.current_stream(device=self.device))
+
+            executor = self._layerwise_save_executor
+            assert executor is not None
+            future = executor.submit(
+                self._advance_layerwise_storer,
+                layerwise_storer,
+                ready_event,
+            )
+            self._layerwise_save_futures.setdefault(
+                request.req_id, []
+            ).append(future)
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
@@ -1096,14 +1139,35 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
+            first_error: Optional[Exception] = None
+            executor = self._layerwise_save_executor
+            assert executor is not None
             for request in connector_metadata.requests:
                 layerwise_storer = self._layerwise_save_storers.pop(
                     request.req_id, None
                 )
+                futures = self._layerwise_save_futures.pop(request.req_id, [])
                 if layerwise_storer is not None:
-                    next(layerwise_storer)
+                    futures.append(
+                        executor.submit(
+                            self._advance_layerwise_storer,
+                            layerwise_storer,
+                            None,
+                        )
+                    )
+
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        if first_error is None:
+                            first_error = exc
+
                 # unpin the kv caches according to req_id
                 self.lmcache_engine.lookup_unpin(request.req_id)
+
+            if first_error is not None:
+                raise first_error
             return
 
         assert len(self.kv_caches) > 0
@@ -1206,6 +1270,9 @@ class LMCacheConnectorV1Impl:
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
+        if self._layerwise_save_executor is not None:
+            self._layerwise_save_executor.shutdown(wait=True)
+            self._layerwise_save_executor = None
         self._manager.stop_services()
 
     ###################
@@ -1665,13 +1732,14 @@ class LMCacheConnectorV1Impl:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        # Layerwise save uses request-scoped generators. If request finishes
+        # Layerwise save uses request-scoped state. If request finishes
         # without entering wait_for_save (abort/error/evict path), make sure
-        # we release the generator entry to avoid leaking state.
+        # we release its entries to avoid leaking state.
         if getattr(self, "use_layerwise", False) and hasattr(
             self, "_layerwise_save_storers"
         ):
             self._layerwise_save_storers.pop(request.request_id, None)
+            self._layerwise_save_futures.pop(request.request_id, None)
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:

@@ -640,6 +640,9 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        prepare_start = time.perf_counter()
+        contains_time = 0.0
+        allocation_time = 0.0
         prev_key = 0
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
@@ -648,15 +651,19 @@ class LMCacheEngine:
 
             keys_multi_layer = key.split_layers(self.num_layers)
             # Only check the first layer
-            if self.storage_manager.contains(
+            contains_start = time.perf_counter()
+            key_exists = self.storage_manager.contains(
                 keys_multi_layer[0], self.retrieve_locations
-            ):
+            )
+            contains_time += time.perf_counter() - contains_start
+            if key_exists:
                 continue
 
             # Allocate the memory object
             num_tokens = end - start
             kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
 
+            allocation_start = time.perf_counter()
             memory_objs_multi_layer = self.storage_manager.batched_allocate(
                 kv_shape_single_layer,
                 kv_dtype,
@@ -664,6 +671,7 @@ class LMCacheEngine:
                 fmt=self.fmt,
                 busy_loop=self.config.get_extra_config_value("force_store_wait", False),
             )
+            allocation_time += time.perf_counter() - allocation_start
 
             if memory_objs_multi_layer is None:
                 logger.warning(
@@ -715,28 +723,51 @@ class LMCacheEngine:
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
+            prepare_time = time.perf_counter() - prepare_start
+            prepare_other_time = max(
+                0.0, prepare_time - contains_time - allocation_time
+            )
             t_start = time.perf_counter()
             io_time = 0.0
+            gpu_offload_step_time = 0.0
+            put_submit_time = 0.0
+            yield_resume_time = 0.0
             mem_obj_generator = self.gpu_connector.batched_from_gpu(
                 memory_objs, starts, ends, **kwargs
             )
 
+            offload_start = time.perf_counter()
             next(mem_obj_generator)
+            gpu_offload_step_time += time.perf_counter() - offload_start
 
             for layer_id in range(self.num_layers):
+                yield_start = time.perf_counter()
                 yield
+                yield_resume_time += time.perf_counter() - yield_start
                 t_io = time.perf_counter()
+                offload_start = time.perf_counter()
                 next(mem_obj_generator)
+                gpu_offload_step_time += time.perf_counter() - offload_start
+                put_start = time.perf_counter()
                 self.storage_manager.batched_put(
                     keys[layer_id], memory_objs[layer_id], location=self.store_location
                 )
+                put_submit_time += time.perf_counter() - put_start
                 io_time += time.perf_counter() - t_io
 
             wall_time = time.perf_counter() - t_start
+            pipeline_other_time = max(
+                0.0,
+                wall_time
+                - yield_resume_time
+                - gpu_offload_step_time
+                - put_submit_time,
+            )
             logger.info(
                 "[req_id=%s] Stored %d out of total %d tokens. "
                 "size: %.4f GB, cost %.4f ms, "
-                "io_time %.4f ms, wall_time %.4f ms, "
+                "io_time %.4f ms, gpu_offload_step_time %.4f ms, "
+                "put_submit_time %.4f ms, wall_time %.4f ms, "
                 "throughput: %.4f GB/s",
                 req_id,
                 tot_token_num,
@@ -744,8 +775,26 @@ class LMCacheEngine:
                 tot_kv_size / 1024**3,
                 io_time * 1000,
                 io_time * 1000,
+                gpu_offload_step_time * 1000,
+                put_submit_time * 1000,
                 wall_time * 1000,
                 tot_kv_size / io_time / 1024**3 if io_time > 0 else 0,
+            )
+            logger.info(
+                "[req_id=%s] Layerwise store pipeline breakdown: "
+                "chunks=%d, prepare_time=%.4f ms, contains_time=%.4f ms, "
+                "allocation_time=%.4f ms, prepare_other_time=%.4f ms, "
+                "yield_resume_time=%.4f ms, pipeline_other_time=%.4f ms, "
+                "total_time=%.4f ms",
+                req_id,
+                len(starts),
+                prepare_time * 1000,
+                contains_time * 1000,
+                allocation_time * 1000,
+                prepare_other_time * 1000,
+                yield_resume_time * 1000,
+                pipeline_other_time * 1000,
+                (prepare_time + wall_time) * 1000,
             )
         else:
             # If no cache are found, we still need to yield to avoid
