@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 import abc
-import ctypes
 import os
 import statistics
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple, Union
 
 # Third Party
@@ -29,7 +27,11 @@ from lmcache.v1.gpu_connector.utils import (
     permute_kv_caches_to_contiguous,
 )
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.memory_management import (
+    MemoryFormat,
+    MemoryObj,
+    TensorMemoryObj,
+)
 from lmcache.v1.metadata import LMCacheMetadata
 
 if torch.cuda.is_available():
@@ -1083,20 +1085,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         self.use_cpu_staging = os.getenv(
             "LMCACHE_USE_CPU_STAGING", "false"
         ).lower() in ("1", "true", "yes")
-        self.cpu_staging_buffer: Optional[torch.Tensor] = None
-        self.cpu_scatter_workers = int(
-            os.getenv("LMCACHE_CPU_SCATTER_WORKERS", "4")
-        )
-        if self.cpu_scatter_workers < 1:
-            raise ValueError("LMCACHE_CPU_SCATTER_WORKERS must be positive")
-        self.cpu_scatter_executor = (
-            ThreadPoolExecutor(
-                max_workers=self.cpu_scatter_workers,
-                thread_name_prefix="lmcache-cpu-scatter",
-            )
-            if self.use_cpu_staging and self.cpu_scatter_workers > 1
-            else None
-        )
 
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
 
@@ -1173,31 +1161,60 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 gpu_buffer_size, device=self.device
             )
 
-    def _get_cpu_staging_buffer(self, shape: torch.Size) -> torch.Tensor:
-        required_elements = shape.numel()
-        if (
-            self.cpu_staging_buffer is None
-            or self.cpu_staging_buffer.numel() < required_elements
-        ):
-            self.cpu_staging_buffer = torch.empty(
-                required_elements,
-                dtype=self.dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-        return self.cpu_staging_buffer[:required_elements].view(shape)
-
-    def _scatter_cpu_chunks(
+    def _replace_with_cpu_staging_views(
         self,
-        copy_jobs: List[Tuple[int, int, int]],
-        chunk_start: int,
-        chunk_end: int,
-    ) -> float:
-        scatter_start = time.perf_counter()
-        for chunk_id in range(chunk_start, chunk_end):
-            destination_ptr, source_ptr, copy_size = copy_jobs[chunk_id]
-            ctypes.memmove(destination_ptr, source_ptr, copy_size)
-        return time.perf_counter() - scatter_start
+        memory_objs: List[MemoryObj],
+        staging_tensor: torch.Tensor,
+        staging_starts: List[int],
+        staging_ends: List[int],
+    ) -> Tuple[float, float, float]:
+        if not memory_objs:
+            return 0.0, 0.0, 0.0
+
+        view_start = time.perf_counter()
+        total_tokens = staging_ends[-1]
+        bytes_per_token = (
+            staging_tensor.numel() * staging_tensor.element_size() // total_tokens
+        )
+        split_sizes = [
+            (end - start) * bytes_per_token
+            for start, end in zip(staging_starts, staging_ends, strict=True)
+        ]
+        raw_views = list(
+            torch.split(
+                staging_tensor.view(torch.uint8).flatten(),
+                split_sizes,
+            )
+        )
+        view_creation_time = time.perf_counter() - view_start
+
+        free_start = time.perf_counter()
+        parent_allocator = memory_objs[0].parent()
+        if parent_allocator is None or any(
+            memory_obj.parent() is not parent_allocator
+            for memory_obj in memory_objs
+        ):
+            raise ValueError(
+                "CPU staging destinations must share one parent allocator"
+            )
+        parent_allocator.batched_free(list(memory_objs))
+        old_buffer_free_time = time.perf_counter() - free_start
+
+        rebind_start = time.perf_counter()
+        fmt = MemoryFormat.KV_MLA_FMT if self.use_mla else memory_objs[0].meta.fmt
+        for memory_obj, raw_view in zip(memory_objs, raw_views, strict=True):
+            if not isinstance(memory_obj, TensorMemoryObj):
+                raise TypeError("CPU staging requires TensorMemoryObj destinations")
+            memory_obj.raw_data = raw_view
+            memory_obj.meta.address = raw_view.data_ptr()
+            memory_obj.meta.phy_size = raw_view.numel()
+            memory_obj.meta.ref_count = 1
+            memory_obj.meta.pin_count = 0
+            memory_obj.meta.fmt = fmt
+            memory_obj.parent_allocator = None
+            memory_obj.valid = True
+        object_rebind_time = time.perf_counter() - rebind_start
+        return view_creation_time, object_rebind_time, old_buffer_free_time
 
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """ """
@@ -1413,58 +1430,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         source_is_contiguous: Optional[bool] = None
         use_cpu_staging = self.use_cpu_staging and self.use_gpu and sync
         cpu_staging_tensor: Optional[torch.Tensor] = None
-        cpu_scatter_jobs: Optional[List[List[Tuple[int, int, int]]]] = None
-        cpu_scatter_prepare_time = 0.0
-        if use_cpu_staging:
-            cpu_staging_tensor = self._get_cpu_staging_buffer(buffer_shape)
-            scatter_prepare_start = time.perf_counter()
-            assert cpu_staging_tensor.device.type == "cpu"
-            assert cpu_staging_tensor.is_contiguous()
-            assert staging_ends[-1] <= cpu_staging_tensor.shape[0]
-            bytes_per_token = (
-                cpu_staging_tensor.stride(0)
-                * cpu_staging_tensor.element_size()
-            )
-            staging_base_ptr = cpu_staging_tensor.data_ptr()
-            cpu_scatter_jobs = []
-            for memory_objs_layer in memory_objs:
-                layer_jobs = []
-                for chunk_id, memory_obj in enumerate(memory_objs_layer):
-                    destination = memory_obj.raw_tensor
-                    if destination is None or destination.device.type != "cpu":
-                        raise ValueError(
-                            "Raw CPU scatter requires CPU destination memory"
-                        )
-                    if not destination.is_contiguous():
-                        raise ValueError("Raw CPU scatter requires contiguous memory")
-                    copy_size = (
-                        staging_ends[chunk_id] - staging_starts[chunk_id]
-                    ) * bytes_per_token
-                    destination_size = memory_obj.get_size()
-                    if destination_size != copy_size:
-                        raise ValueError(
-                            "CPU scatter source and destination sizes differ: "
-                            f"source={copy_size}, destination={destination_size}"
-                        )
-                    layer_jobs.append(
-                        (
-                            destination.data_ptr(),
-                            staging_base_ptr
-                            + staging_starts[chunk_id] * bytes_per_token,
-                            copy_size,
-                        )
-                    )
-                cpu_scatter_jobs.append(layer_jobs)
-
-            if memory_objs and memory_objs[0]:
-                first_destination = memory_objs[0][0].raw_tensor
-                assert first_destination is not None
-                destination_is_pinned = first_destination.is_pinned()
-                destination_is_contiguous = first_destination.is_contiguous()
-                source_is_contiguous = cpu_staging_tensor.is_contiguous()
-            cpu_scatter_prepare_time = (
-                time.perf_counter() - scatter_prepare_start
-            )
+        cpu_staging_allocation_time = 0.0
+        cpu_view_creation_time = 0.0
+        cpu_object_rebind_time = 0.0
+        cpu_old_buffer_free_time = 0.0
+        cpu_view_count = 0
 
         offset = starts[0]
         current_stream = torch.cuda.current_stream()
@@ -1483,9 +1453,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         last_eight_copy_call_time = 0.0
         last_eight_copy_count = 0
         staging_d2h_submit_time = 0.0
-        cpu_scatter_wall_time = 0.0
-        cpu_scatter_copy_count = 0
-        cpu_scatter_worker_times: list[float] = []
         stream_dependency_gpu_time_ms = 0.0
         gather_gpu_time_ms = 0.0
         d2h_gpu_time_ms = 0.0
@@ -1515,6 +1482,21 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = memory_objs[layer_id]
+            if use_cpu_staging:
+                allocation_start = time.perf_counter()
+                cpu_staging_tensor = torch.empty(
+                    buffer_shape,
+                    dtype=self.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                cpu_staging_allocation_time += (
+                    time.perf_counter() - allocation_start
+                )
+                if destination_is_pinned is None:
+                    destination_is_pinned = cpu_staging_tensor.is_pinned()
+                    destination_is_contiguous = cpu_staging_tensor.is_contiguous()
+                    source_is_contiguous = cpu_staging_tensor.is_contiguous()
             # kvcaches -> gpu_buffer -> memobj
             with torch.cuda.stream(self.store_stream):
                 if layer_start_event is not None:
@@ -1657,50 +1639,20 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 d2h_gpu_time_ms += gather_end_event.elapsed_time(d2h_end_event)
             if use_cpu_staging:
                 assert cpu_staging_tensor is not None
-                assert cpu_scatter_jobs is not None
-                scatter_start = time.perf_counter()
-                layer_jobs = cpu_scatter_jobs[layer_id]
-                num_scatter_workers = min(self.cpu_scatter_workers, len(layer_jobs))
-                if num_scatter_workers <= 1:
-                    scatter_results = [
-                        self._scatter_cpu_chunks(
-                            layer_jobs,
-                            0,
-                            len(layer_jobs),
-                        )
-                    ]
-                else:
-                    assert self.cpu_scatter_executor is not None
-                    futures = []
-                    for worker_id in range(num_scatter_workers):
-                        chunk_start = (
-                            len(layer_jobs)
-                            * worker_id
-                            // num_scatter_workers
-                        )
-                        chunk_end = (
-                            len(layer_jobs)
-                            * (worker_id + 1)
-                            // num_scatter_workers
-                        )
-                        futures.append(
-                            self.cpu_scatter_executor.submit(
-                                self._scatter_cpu_chunks,
-                                layer_jobs,
-                                chunk_start,
-                                chunk_end,
-                            )
-                        )
-                    scatter_results = [future.result() for future in futures]
-
-                cpu_scatter_copy_count += len(layer_jobs)
-                cpu_scatter_worker_times.extend(scatter_results)
-                if self.use_mla:
-                    for memory_obj in memory_objs_layer:
-                        memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
-                cpu_scatter_wall_time += (
-                    time.perf_counter() - scatter_start
+                (
+                    view_creation_time,
+                    object_rebind_time,
+                    old_buffer_free_time,
+                ) = self._replace_with_cpu_staging_views(
+                    memory_objs_layer,
+                    cpu_staging_tensor,
+                    staging_starts,
+                    staging_ends,
                 )
+                cpu_view_count += len(memory_objs_layer)
+                cpu_view_creation_time += view_creation_time
+                cpu_object_rebind_time += object_rebind_time
+                cpu_old_buffer_free_time += old_buffer_free_time
             logger.debug(f"Finished offloading layer {layer_id}")
 
         logger.info(
@@ -1728,40 +1680,22 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         )
 
         if use_cpu_staging:
-            sorted_worker_times = sorted(cpu_scatter_worker_times)
-            worker_time_p50 = (
-                statistics.median(sorted_worker_times)
-                if sorted_worker_times
-                else 0.0
-            )
-            worker_time_p95 = (
-                sorted_worker_times[
-                    int(0.95 * (len(sorted_worker_times) - 1))
-                ]
-                if sorted_worker_times
-                else 0.0
-            )
             logger.info(
                 "[req_id=%s] Layerwise CPU staging breakdown: "
-                "copies=%d, worker_tasks=%d, scatter_workers=%d, "
-                "scatter_prepare_time=%.4f ms, "
+                "layers=%d, views=%d, staging_allocation_time=%.4f ms, "
                 "staging_d2h_submit_time=%.4f ms, "
-                "cpu_scatter_wall_time=%.4f ms, "
-                "worker_time_sum=%.4f ms, worker_time_p50=%.4f ms, "
-                "worker_time_p95=%.4f ms, worker_time_max=%.4f ms, "
+                "view_creation_time=%.4f ms, object_rebind_time=%.4f ms, "
+                "old_buffer_free_time=%.4f ms, "
                 "dst_pinned=%s, "
                 "dst_contiguous=%s, src_contiguous=%s",
                 kwargs.get("req_id"),
-                cpu_scatter_copy_count,
-                len(cpu_scatter_worker_times),
-                min(self.cpu_scatter_workers, num_chunks_per_layer),
-                cpu_scatter_prepare_time * 1000,
+                self.num_layers,
+                cpu_view_count,
+                cpu_staging_allocation_time * 1000,
                 staging_d2h_submit_time * 1000,
-                cpu_scatter_wall_time * 1000,
-                sum(cpu_scatter_worker_times) * 1000,
-                worker_time_p50 * 1000,
-                worker_time_p95 * 1000,
-                max(cpu_scatter_worker_times, default=0.0) * 1000,
+                cpu_view_creation_time * 1000,
+                cpu_object_rebind_time * 1000,
+                cpu_old_buffer_free_time * 1000,
                 destination_is_pinned,
                 destination_is_contiguous,
                 source_is_contiguous,
