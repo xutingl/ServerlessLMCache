@@ -3,6 +3,7 @@
 from concurrent.futures import Future, TimeoutError
 from typing import Any, Callable, List, Optional, Sequence, Set
 import asyncio
+import os
 import threading
 import time
 
@@ -540,14 +541,44 @@ class RemoteBackend(StorageBackendInterface):
                 "Connection is None in batched_get_non_blocking, returning empty list"
             )
             return []
+        load_profile_enabled = os.getenv("LMCACHE_LOAD_PROFILE", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        started = time.perf_counter()
         try:
             # warning, this timeout will not actually stop the
             # scheduler from waiting for the result
-            return await asyncio.wait_for(
+            memory_objs = await asyncio.wait_for(
                 self.connection.batched_get_non_blocking(lookup_id, keys),
                 self.config.blocking_timeout_secs,
             )
+            if load_profile_enabled:
+                total_size = sum(
+                    memory_obj.get_size()
+                    for memory_obj in memory_objs
+                    if memory_obj is not None
+                )
+                logger.info(
+                    "RemoteBackend batched_get_non_blocking lookup_id=%s "
+                    "keys=%d returned=%d bytes=%d elapsed=%.4f ms",
+                    lookup_id,
+                    len(keys),
+                    sum(1 for memory_obj in memory_objs if memory_obj is not None),
+                    total_size,
+                    (time.perf_counter() - started) * 1000,
+                )
+            return memory_objs
         except asyncio.TimeoutError:
+            if load_profile_enabled:
+                logger.info(
+                    "RemoteBackend batched_get_non_blocking timeout lookup_id=%s "
+                    "keys=%d elapsed=%.4f ms",
+                    lookup_id,
+                    len(keys),
+                    (time.perf_counter() - started) * 1000,
+                )
             logger.warning("batched_get_non_blocking timed out")
             return []
         except Exception as e:

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 import asyncio
 import gc
 import multiprocessing
+import os
 import time
 
 # Third Party
@@ -604,7 +605,6 @@ class LMCacheEngine:
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
-
         if mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
         else:
@@ -998,6 +998,11 @@ class LMCacheEngine:
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
+        load_profile_enabled = os.getenv("LMCACHE_LOAD_PROFILE", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
         if mask is not None:
             num_required_tokens = torch.sum(mask).item()
@@ -1016,6 +1021,7 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         location = None
+        contains_time = 0.0
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
@@ -1026,9 +1032,12 @@ class LMCacheEngine:
             keys_multi_layer = key.split_layers(self.num_layers)
 
             # NOTE: Only check the first layer
-            if current_location := self.storage_manager.contains(
+            contains_start = time.perf_counter()
+            current_location = self.storage_manager.contains(
                 keys_multi_layer[0], self.retrieve_locations
-            ):
+            )
+            contains_time += time.perf_counter() - contains_start
+            if current_location:
                 if location is None:
                     location = current_location
                 else:
@@ -1047,9 +1056,29 @@ class LMCacheEngine:
 
             ret_mask[start:end] = True
 
+        submit_time = 0.0
+        yield_resume_time = 0.0
+        result_wait_time = 0.0
+        to_gpu_send_time = 0.0
+        final_yield_wait = 0.0
+        final_sync_time = 0.0
+
         if keys:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
+            if load_profile_enabled:
+                logger.info(
+                    "[req_id=%s] Layerwise load matched chunks=%d layers=%d "
+                    "location=%s required_tokens=%s total_tokens=%s "
+                    "contains_time=%.4f ms",
+                    req_id,
+                    len(keys),
+                    self.num_layers,
+                    location,
+                    num_required_tokens,
+                    len(tokens),
+                    contains_time * 1000,
+                )
 
             get_generator = self.storage_manager.layerwise_batched_get(
                 keys_layer_major,
@@ -1067,26 +1096,59 @@ class LMCacheEngine:
 
             to_count_down = []
             for layer_id in range(self.num_layers):
+                layer_start = time.perf_counter()
                 t_io = time.perf_counter()
                 task = next(get_generator)
-                io_time += time.perf_counter() - t_io
+                submit_elapsed = time.perf_counter() - t_io
+                submit_time += submit_elapsed
+                io_time += submit_elapsed
 
                 assert task is not None
 
+                yield_start = time.perf_counter()
                 if layer_id == 0:
                     # NOTE(Yuwei): For sglang integration we need to provide retrieved
                     # tokens number in the first layer loading since there is no lookup
                     yield torch.sum(ret_mask)
                 else:
                     yield None
+                yield_elapsed = time.perf_counter() - yield_start
+                yield_resume_time += yield_elapsed
 
                 t_io = time.perf_counter()
                 mem_objs_layer = task.result()
+                result_elapsed = time.perf_counter() - t_io
+                result_wait_time += result_elapsed
+                io_time += result_elapsed
+
+                t_io = time.perf_counter()
                 mem_obj_consumer.send(mem_objs_layer)
-                io_time += time.perf_counter() - t_io
+                send_elapsed = time.perf_counter() - t_io
+                to_gpu_send_time += send_elapsed
+                io_time += send_elapsed
+
+                layer_bytes = 0
                 for mo in mem_objs_layer:
-                    tot_kv_size += mo.get_size()
+                    obj_size = mo.get_size()
+                    layer_bytes += obj_size
+                    tot_kv_size += obj_size
                 to_count_down.extend(mem_objs_layer)
+                if load_profile_enabled:
+                    logger.info(
+                        "[req_id=%s] Layerwise load layer=%d chunks=%d "
+                        "bytes=%d submit_time=%.4f ms yield_resume_time=%.4f ms "
+                        "result_wait_time=%.4f ms to_gpu_send_time=%.4f ms "
+                        "layer_wall_time=%.4f ms",
+                        req_id,
+                        layer_id,
+                        len(mem_objs_layer),
+                        layer_bytes,
+                        submit_elapsed * 1000,
+                        yield_elapsed * 1000,
+                        result_elapsed * 1000,
+                        send_elapsed * 1000,
+                        (time.perf_counter() - layer_start) * 1000,
+                    )
 
             for mem_obj in to_count_down:
                 mem_obj.ref_count_down()
@@ -1099,10 +1161,14 @@ class LMCacheEngine:
             for layer_id in range(self.num_layers):
                 yield None
 
+        final_yield_start = time.perf_counter()
         yield None
+        final_yield_wait = time.perf_counter() - final_yield_start
 
         # synchronize the last layer
+        final_sync_start = time.perf_counter()
         next(mem_obj_consumer)
+        final_sync_time = time.perf_counter() - final_sync_start
 
         # Unpin any disk-loaded staging objects now that the device-side sync
         # has been enqueued (mem_obj_consumer advanced past its sync point).
@@ -1131,6 +1197,26 @@ class LMCacheEngine:
                 wall_time * 1000,
                 tot_kv_size / io_time / 1024**3 if io_time > 0 else 0,
             )
+            if load_profile_enabled:
+                logger.info(
+                    "[req_id=%s] Layerwise load profile summary: "
+                    "chunks=%d layers=%d contains_time=%.4f ms "
+                    "submit_time=%.4f ms yield_resume_time=%.4f ms "
+                    "result_wait_time=%.4f ms to_gpu_send_time=%.4f ms "
+                    "final_yield_wait=%.4f ms final_sync_time=%.4f ms "
+                    "wall_time=%.4f ms",
+                    req_id,
+                    len(keys),
+                    self.num_layers,
+                    contains_time * 1000,
+                    submit_time * 1000,
+                    yield_resume_time * 1000,
+                    result_wait_time * 1000,
+                    to_gpu_send_time * 1000,
+                    final_yield_wait * 1000,
+                    final_sync_time * 1000,
+                    wall_time * 1000,
+                )
 
         yield ret_mask
 

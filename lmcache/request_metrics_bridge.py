@@ -11,6 +11,13 @@ _disabled = False
 def _get_request_metrics_logger() -> Any | None:
     global _disabled
     global _request_metrics_logger
+    if os.getenv("LMCACHE_REQUEST_METRICS_ENABLED", "true").lower() in (
+        "0",
+        "false",
+        "no",
+    ):
+        _disabled = True
+        return None
     if _disabled:
         return None
     if _request_metrics_logger is not None:

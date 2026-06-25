@@ -17,7 +17,9 @@ from typing import (
 )
 import asyncio
 import functools
+import os
 import threading
+import time
 
 # Third Party
 import torch
@@ -531,12 +533,29 @@ class StorageManager:
         """
         if location is None:
             location = "LocalCPUBackend"
-        for keys_multi_chunk in keys:
+        load_profile_enabled = os.getenv("LMCACHE_LOAD_PROFILE", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        for layer_id, keys_multi_chunk in enumerate(keys):
             # Retrieve all chunks for one layer
             backend = self.storage_backends[location]
             # TODO(Jiayi): need to make async loading and layerwise compatible
+            submit_start = time.perf_counter()
             coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
+            submit_elapsed = time.perf_counter() - submit_start
+            if load_profile_enabled:
+                logger.info(
+                    "Layerwise storage get submit layer=%d location=%s backend=%s "
+                    "chunks=%d submit_time=%.4f ms",
+                    layer_id,
+                    location,
+                    backend.__class__.__name__,
+                    len(keys_multi_chunk),
+                    submit_elapsed * 1000,
+                )
             yield task
 
     def prefetch_single_done_callback(
