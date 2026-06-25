@@ -37,6 +37,7 @@ from lmcache.integration.vllm.utils import (
 from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
+from lmcache.request_metrics_bridge import log_lmcache_count_metric
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.compute.blend import LMCBlenderBuilder
@@ -1400,6 +1401,13 @@ class LMCacheConnectorV1Impl:
                 num_external_hit_tokens,
                 max(need_to_allocate, 0),
             )
+
+        log_lmcache_count_metric(
+            req_id, "LmcacheHitTokens", num_external_hit_tokens
+        )
+        log_lmcache_count_metric(
+            req_id, "LmcacheNeedToLoadTokens", max(need_to_allocate, 0)
+        )
 
         self.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,

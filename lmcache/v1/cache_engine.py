@@ -30,6 +30,7 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
+from lmcache.request_metrics_bridge import log_lmcache_count_metric
 from lmcache.usage_context import InitializeUsageContext
 from lmcache.utils import (
     CacheEngineKey,
@@ -921,6 +922,7 @@ class LMCacheEngine:
                 memory_obj.ref_count_down()
 
         retrieved_tokens = torch.sum(ret_mask)
+        log_lmcache_count_metric(req_id, "LmcacheRetrievedTokens", retrieved_tokens)
         self.stats_monitor.on_retrieve_finished(
             retrieve_stats,
             retrieved_tokens,
@@ -1112,6 +1114,7 @@ class LMCacheEngine:
 
         wall_time = time.perf_counter() - t_start
         retrieved_tokens = torch.sum(ret_mask)
+        log_lmcache_count_metric(req_id, "LmcacheRetrievedTokens", retrieved_tokens)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
         if not self._is_passive():
             logger.info(
