@@ -641,6 +641,36 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        store_timeline_enabled = (
+            os.environ.get("PD_BACKEND_LAYER_TIMING") == "1"
+            or os.environ.get("PD_BACKEND_STORE_TIMELINE") == "1"
+        )
+        store_timeline_seq = 0
+
+        def log_store_timeline(
+            phase: str,
+            start_time: float,
+            end_time: float,
+            layer_id: int = -1,
+            extra: str = "",
+        ) -> None:
+            nonlocal store_timeline_seq
+            if not store_timeline_enabled:
+                return
+            logger.info(
+                "[pd-demo-store-timeline] req_id=%s seq=%d phase=%s "
+                "layer=%d t_start_ms=%.4f t_end_ms=%.4f dur_ms=%.4f%s",
+                req_id,
+                store_timeline_seq,
+                phase,
+                layer_id,
+                (start_time - prepare_start) * 1000,
+                (end_time - prepare_start) * 1000,
+                (end_time - start_time) * 1000,
+                f" {extra}" if extra else "",
+            )
+            store_timeline_seq += 1
+
         prepare_start = time.perf_counter()
         contains_time = 0.0
         allocation_time = 0.0
@@ -724,45 +754,159 @@ class LMCacheEngine:
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
-            prepare_time = time.perf_counter() - prepare_start
+            prepare_end = time.perf_counter()
+            prepare_time = prepare_end - prepare_start
             prepare_other_time = max(
                 0.0, prepare_time - contains_time - allocation_time
             )
+            log_store_timeline(
+                "prepare_tokens",
+                prepare_start,
+                prepare_end,
+                extra=(
+                    f"chunks={len(starts)} contains_ms={contains_time * 1000:.4f} "
+                    f"allocation_ms={allocation_time * 1000:.4f} "
+                    f"prepare_other_ms={prepare_other_time * 1000:.4f}"
+                ),
+            )
+            remote_prepare_submit_time = 0.0
+            remote_prepare_layers = 0
+            transfer_spec = kwargs.get("transfer_spec")
+            if transfer_spec is not None:
+                remote_prepare_start = time.perf_counter()
+                for backend_name, backend in self.storage_manager.storage_backends.items():
+                    if self.store_location and backend_name != self.store_location:
+                        continue
+                    prepare_put = getattr(backend, "prepare_batched_put_task", None)
+                    if prepare_put is None:
+                        continue
+                    for layer_keys, layer_memory_objs in zip(
+                        keys, memory_objs, strict=False
+                    ):
+                        prepare_put(
+                            layer_keys,
+                            layer_memory_objs,
+                            transfer_spec=transfer_spec,
+                        )
+                        remote_prepare_layers += 1
+                remote_prepare_end = time.perf_counter()
+                remote_prepare_submit_time = (
+                    remote_prepare_end - remote_prepare_start
+                )
+                log_store_timeline(
+                    "remote_prepare_submit",
+                    remote_prepare_start,
+                    remote_prepare_end,
+                    extra=(
+                        f"layers={remote_prepare_layers} chunks={len(starts)}"
+                    ),
+                )
             t_start = time.perf_counter()
             io_time = 0.0
             gpu_offload_step_time = 0.0
             put_submit_time = 0.0
             yield_resume_time = 0.0
+            layer_connector_next_time = 0.0
+            layer_step_time = 0.0
+            detailed_offload_timing = os.environ.get("PD_BACKEND_LAYER_TIMING") == "1"
+            mem_obj_generator_create_start = time.perf_counter()
             mem_obj_generator = self.gpu_connector.batched_from_gpu(
                 memory_objs, starts, ends, **kwargs
+            )
+            mem_obj_generator_create_end = time.perf_counter()
+            log_store_timeline(
+                "mem_obj_generator_create",
+                mem_obj_generator_create_start,
+                mem_obj_generator_create_end,
             )
 
             offload_start = time.perf_counter()
             next(mem_obj_generator)
-            gpu_offload_step_time += time.perf_counter() - offload_start
+            offload_end = time.perf_counter()
+            offload_elapsed = offload_end - offload_start
+            gpu_offload_step_time += offload_elapsed
+            log_store_timeline(
+                "connector_next_initial",
+                offload_start,
+                offload_end,
+                extra="description=enqueue_first_layer",
+            )
+            if detailed_offload_timing:
+                logger.info(
+                    "[req_id=%s] Layerwise offload step: "
+                    "step=initial put_layer=-1 next_ms=%.4f",
+                    req_id,
+                    offload_elapsed * 1000,
+                )
 
             for layer_id in range(self.num_layers):
                 yield_start = time.perf_counter()
                 yield
-                yield_resume_time += time.perf_counter() - yield_start
+                yield_end = time.perf_counter()
+                yield_elapsed = yield_end - yield_start
+                yield_resume_time += yield_elapsed
                 t_io = time.perf_counter()
                 offload_start = time.perf_counter()
                 next(mem_obj_generator)
-                gpu_offload_step_time += time.perf_counter() - offload_start
+                offload_end = time.perf_counter()
+                offload_elapsed = offload_end - offload_start
+                gpu_offload_step_time += offload_elapsed
+                layer_connector_next_time += offload_elapsed
+                if detailed_offload_timing:
+                    logger.info(
+                        "[req_id=%s] Layerwise offload step: "
+                        "step=loop put_layer=%d next_ms=%.4f",
+                        req_id,
+                        layer_id,
+                        offload_elapsed * 1000,
+                    )
                 put_start = time.perf_counter()
                 self.storage_manager.batched_put(
-                    keys[layer_id], memory_objs[layer_id], location=self.store_location
+                    keys[layer_id],
+                    memory_objs[layer_id],
+                    transfer_spec=transfer_spec,
+                    location=self.store_location,
                 )
-                put_submit_time += time.perf_counter() - put_start
-                io_time += time.perf_counter() - t_io
+                put_end = time.perf_counter()
+                put_elapsed = put_end - put_start
+                put_submit_time += put_elapsed
+                io_time += put_end - t_io
+                layer_step_time += put_end - yield_end
+                log_store_timeline(
+                    "layer_step",
+                    yield_start,
+                    put_end,
+                    layer_id=layer_id,
+                    extra=(
+                        f"yield_wait_ms={yield_elapsed * 1000:.4f} "
+                        f"connector_next_ms={offload_elapsed * 1000:.4f} "
+                        f"put_submit_ms={put_elapsed * 1000:.4f} "
+                        f"active_ms={(put_end - yield_end) * 1000:.4f}"
+                    ),
+                )
 
-            wall_time = time.perf_counter() - t_start
+            wall_end = time.perf_counter()
+            wall_time = wall_end - t_start
             pipeline_other_time = max(
                 0.0,
                 wall_time
                 - yield_resume_time
                 - gpu_offload_step_time
                 - put_submit_time,
+            )
+            log_store_timeline(
+                "store_pipeline_total",
+                t_start,
+                wall_end,
+                extra=(
+                    f"initial_connector_next_ms="
+                    f"{(gpu_offload_step_time - layer_connector_next_time) * 1000:.4f} "
+                    f"layer_connector_next_ms={layer_connector_next_time * 1000:.4f} "
+                    f"yield_wait_ms={yield_resume_time * 1000:.4f} "
+                    f"put_submit_ms={put_submit_time * 1000:.4f} "
+                    f"active_layer_ms={layer_step_time * 1000:.4f} "
+                    f"other_ms={pipeline_other_time * 1000:.4f}"
+                ),
             )
             logger.info(
                 "[req_id=%s] Stored %d out of total %d tokens. "
@@ -785,6 +929,7 @@ class LMCacheEngine:
                 "[req_id=%s] Layerwise store pipeline breakdown: "
                 "chunks=%d, prepare_time=%.4f ms, contains_time=%.4f ms, "
                 "allocation_time=%.4f ms, prepare_other_time=%.4f ms, "
+                "remote_prepare_layers=%d, remote_prepare_submit_time=%.4f ms, "
                 "yield_resume_time=%.4f ms, pipeline_other_time=%.4f ms, "
                 "total_time=%.4f ms",
                 req_id,
@@ -793,9 +938,11 @@ class LMCacheEngine:
                 contains_time * 1000,
                 allocation_time * 1000,
                 prepare_other_time * 1000,
+                remote_prepare_layers,
+                remote_prepare_submit_time * 1000,
                 yield_resume_time * 1000,
                 pipeline_other_time * 1000,
-                (prepare_time + wall_time) * 1000,
+                (wall_end - prepare_start) * 1000,
             )
         else:
             # If no cache are found, we still need to yield to avoid
