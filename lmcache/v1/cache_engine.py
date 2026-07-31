@@ -2,6 +2,7 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -24,6 +25,7 @@ import copy
 import gc
 import multiprocessing
 import os
+import threading
 import time
 
 # Third Party
@@ -43,7 +45,10 @@ from lmcache.utils import (
 )
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
-from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
+from lmcache.v1.gpu_connector.gpu_connectors import (
+    GPUConnectorInterface,
+    LayerwiseOffloadHandle,
+)
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import CuFileMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (  # noqa: E501
@@ -69,6 +74,17 @@ from lmcache.v1.token_database import (
 )
 
 logger = init_logger(__name__)
+
+
+def _layerwise_put_workers() -> int:
+    value = os.environ.get("PD_BACKEND_LAYERWISE_PUT_WORKERS")
+    if value is None:
+        return 1
+    workers = int(value)
+    if workers < 1:
+        raise ValueError("PD_BACKEND_LAYERWISE_PUT_WORKERS must be positive")
+    return workers
+
 
 # Type aliases for processed chunks
 # (cache_key, memory_obj, start_index, end_index)
@@ -209,6 +225,17 @@ class LMCacheEngine:
         self.event_manager = EventManager()
 
         self.use_layerwise = config.use_layerwise
+        self._layerwise_put_executor: Optional[ThreadPoolExecutor] = None
+        if self.use_layerwise:
+            layerwise_put_workers = _layerwise_put_workers()
+            logger.info(
+                "Creating layerwise put executor with max_workers=%d",
+                layerwise_put_workers,
+            )
+            self._layerwise_put_executor = ThreadPoolExecutor(
+                max_workers=layerwise_put_workers,
+                thread_name_prefix="lmcache-layer-put",
+            )
 
         # TODO: support save_only_first_rank when use layerwise
         # if use_layerwise is True, all ranks will initialize the storage_manager
@@ -888,6 +915,9 @@ class LMCacheEngine:
             io_time = 0.0
             gpu_offload_step_time = 0.0
             put_submit_time = 0.0
+            put_ready_wait_time = 0.0
+            put_future_wait_time = 0.0
+            put_task_wall_time = 0.0
             yield_resume_time = 0.0
             layer_connector_next_time = 0.0
             layer_step_time = 0.0
@@ -903,8 +933,80 @@ class LMCacheEngine:
                 mem_obj_generator_create_end,
             )
 
+            def is_layerwise_offload_handle(result: Any) -> bool:
+                return isinstance(result, LayerwiseOffloadHandle)
+
+            put_futures: list[Future[None]] = []
+            put_stats_lock = threading.Lock()
+
+            def submit_layer_put(
+                layer_id: int,
+                offload_handle: LayerwiseOffloadHandle,
+            ) -> None:
+                nonlocal io_time
+                nonlocal put_submit_time
+                nonlocal put_ready_wait_time
+                nonlocal put_task_wall_time
+                executor = self._layerwise_put_executor
+                assert executor is not None
+
+                def wait_and_put() -> None:
+                    nonlocal io_time
+                    nonlocal put_submit_time
+                    nonlocal put_ready_wait_time
+                    nonlocal put_task_wall_time
+                    task_start = time.perf_counter()
+                    wait_start = time.perf_counter()
+                    try:
+                        offload_handle.wait()
+                    except Exception:
+                        for memory_obj in memory_objs[layer_id]:
+                            memory_obj.ref_count_down()
+                        raise
+                    wait_end = time.perf_counter()
+                    ready_wait_elapsed = wait_end - wait_start
+
+                    put_start = time.perf_counter()
+                    self.storage_manager.batched_put(
+                        keys[layer_id],
+                        memory_objs[layer_id],
+                        transfer_spec=transfer_spec,
+                        location=self.store_location,
+                    )
+                    put_end = time.perf_counter()
+                    put_elapsed = put_end - put_start
+                    task_wall_elapsed = put_end - task_start
+                    with put_stats_lock:
+                        put_ready_wait_time += ready_wait_elapsed
+                        put_submit_time += put_elapsed
+                        io_time += task_wall_elapsed
+                        put_task_wall_time += task_wall_elapsed
+                    if detailed_offload_timing:
+                        logger.info(
+                            "[req_id=%s] Layerwise async put step: "
+                            "layer=%d ready_wait_ms=%.4f "
+                            "put_submit_ms=%.4f task_ms=%.4f",
+                            req_id,
+                            layer_id,
+                            ready_wait_elapsed * 1000,
+                            put_elapsed * 1000,
+                            task_wall_elapsed * 1000,
+                        )
+
+                submit_start = time.perf_counter()
+                future = executor.submit(wait_and_put)
+                submit_end = time.perf_counter()
+                put_futures.append(future)
+                log_store_timeline(
+                    "async_put_task_submit",
+                    submit_start,
+                    submit_end,
+                    layer_id=layer_id,
+                    extra=f"futures={len(put_futures)}",
+                )
+
             offload_start = time.perf_counter()
-            next(mem_obj_generator)
+            first_offload_handle = next(mem_obj_generator)
             offload_end = time.perf_counter()
             offload_elapsed = offload_end - offload_start
             gpu_offload_step_time += offload_elapsed
@@ -922,51 +1024,137 @@ class LMCacheEngine:
                     offload_elapsed * 1000,
                 )
 
-            for layer_id in range(self.num_layers):
-                yield_start = time.perf_counter()
-                yield
-                yield_end = time.perf_counter()
-                yield_elapsed = yield_end - yield_start
-                yield_resume_time += yield_elapsed
-                t_io = time.perf_counter()
-                offload_start = time.perf_counter()
-                next(mem_obj_generator)
-                offload_end = time.perf_counter()
-                offload_elapsed = offload_end - offload_start
-                gpu_offload_step_time += offload_elapsed
-                layer_connector_next_time += offload_elapsed
-                if detailed_offload_timing:
-                    logger.info(
-                        "[req_id=%s] Layerwise offload step: "
-                        "step=loop put_layer=%d next_ms=%.4f",
-                        req_id,
-                        layer_id,
-                        offload_elapsed * 1000,
+            if is_layerwise_offload_handle(first_offload_handle):
+                if getattr(first_offload_handle, "layer_id", 0) != 0:
+                    raise RuntimeError(
+                        "Layerwise offload handle order mismatch: "
+                        f"expected layer 0, got {first_offload_handle.layer_id}"
                     )
-                put_start = time.perf_counter()
-                self.storage_manager.batched_put(
-                    keys[layer_id],
-                    memory_objs[layer_id],
-                    transfer_spec=transfer_spec,
-                    location=self.store_location,
-                )
-                put_end = time.perf_counter()
-                put_elapsed = put_end - put_start
-                put_submit_time += put_elapsed
-                io_time += put_end - t_io
-                layer_step_time += put_end - yield_end
+                submit_layer_put(0, first_offload_handle)
+
+                for layer_id in range(1, self.num_layers):
+                    yield_start = time.perf_counter()
+                    yield
+                    yield_end = time.perf_counter()
+                    yield_elapsed = yield_end - yield_start
+                    yield_resume_time += yield_elapsed
+
+                    offload_start = time.perf_counter()
+                    offload_handle = next(mem_obj_generator)
+                    offload_end = time.perf_counter()
+                    offload_elapsed = offload_end - offload_start
+                    gpu_offload_step_time += offload_elapsed
+                    layer_connector_next_time += offload_elapsed
+                    if (
+                        not is_layerwise_offload_handle(offload_handle)
+                        or getattr(offload_handle, "layer_id", None) != layer_id
+                    ):
+                        raise RuntimeError(
+                            "Layerwise offload handle order mismatch: "
+                            f"expected layer {layer_id}, "
+                            f"got {getattr(offload_handle, 'layer_id', None)}"
+                        )
+                    submit_layer_put(layer_id, offload_handle)
+                    layer_end = time.perf_counter()
+                    layer_step_time += layer_end - yield_end
+                    if detailed_offload_timing:
+                        logger.info(
+                            "[req_id=%s] Layerwise offload step: "
+                            "step=async_enqueue layer=%d next_ms=%.4f",
+                            req_id,
+                            layer_id,
+                            offload_elapsed * 1000,
+                        )
+                    log_store_timeline(
+                        "layer_enqueue_step",
+                        yield_start,
+                        layer_end,
+                        layer_id=layer_id,
+                        extra=(
+                            f"yield_wait_ms={yield_elapsed * 1000:.4f} "
+                            f"connector_next_ms={offload_elapsed * 1000:.4f} "
+                            f"active_ms={(layer_end - yield_end) * 1000:.4f}"
+                        ),
+                    )
+
+                final_yield_start = time.perf_counter()
+                yield
+                final_yield_end = time.perf_counter()
+                yield_resume_time += final_yield_end - final_yield_start
+
+                first_error: Optional[Exception] = None
+                future_wait_start = time.perf_counter()
+                for future in put_futures:
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        if first_error is None:
+                            first_error = exc
+                future_wait_end = time.perf_counter()
+                put_future_wait_time += future_wait_end - future_wait_start
                 log_store_timeline(
-                    "layer_step",
-                    yield_start,
-                    put_end,
-                    layer_id=layer_id,
-                    extra=(
-                        f"yield_wait_ms={yield_elapsed * 1000:.4f} "
-                        f"connector_next_ms={offload_elapsed * 1000:.4f} "
-                        f"put_submit_ms={put_elapsed * 1000:.4f} "
-                        f"active_ms={(put_end - yield_end) * 1000:.4f}"
-                    ),
+                    "async_put_tasks_wait",
+                    future_wait_start,
+                    future_wait_end,
+                    extra=f"futures={len(put_futures)}",
                 )
+
+                finalize_start = time.perf_counter()
+                next(mem_obj_generator)
+                finalize_end = time.perf_counter()
+                log_store_timeline(
+                    "connector_finalize",
+                    finalize_start,
+                    finalize_end,
+                )
+                if first_error is not None:
+                    raise first_error
+            else:
+                for layer_id in range(self.num_layers):
+                    yield_start = time.perf_counter()
+                    yield
+                    yield_end = time.perf_counter()
+                    yield_elapsed = yield_end - yield_start
+                    yield_resume_time += yield_elapsed
+                    t_io = time.perf_counter()
+                    offload_start = time.perf_counter()
+                    next(mem_obj_generator)
+                    offload_end = time.perf_counter()
+                    offload_elapsed = offload_end - offload_start
+                    gpu_offload_step_time += offload_elapsed
+                    layer_connector_next_time += offload_elapsed
+                    if detailed_offload_timing:
+                        logger.info(
+                            "[req_id=%s] Layerwise offload step: "
+                            "step=loop put_layer=%d next_ms=%.4f",
+                            req_id,
+                            layer_id,
+                            offload_elapsed * 1000,
+                        )
+                    put_start = time.perf_counter()
+                    self.storage_manager.batched_put(
+                        keys[layer_id],
+                        memory_objs[layer_id],
+                        transfer_spec=transfer_spec,
+                        location=self.store_location,
+                    )
+                    put_end = time.perf_counter()
+                    put_elapsed = put_end - put_start
+                    put_submit_time += put_elapsed
+                    io_time += put_end - t_io
+                    layer_step_time += put_end - yield_end
+                    log_store_timeline(
+                        "layer_step",
+                        yield_start,
+                        put_end,
+                        layer_id=layer_id,
+                        extra=(
+                            f"yield_wait_ms={yield_elapsed * 1000:.4f} "
+                            f"connector_next_ms={offload_elapsed * 1000:.4f} "
+                            f"put_submit_ms={put_elapsed * 1000:.4f} "
+                            f"active_ms={(put_end - yield_end) * 1000:.4f}"
+                        ),
+                    )
 
             wall_end = time.perf_counter()
             wall_time = wall_end - t_start
@@ -975,6 +1163,7 @@ class LMCacheEngine:
                 wall_time
                 - yield_resume_time
                 - gpu_offload_step_time
+                - put_ready_wait_time
                 - put_submit_time,
             )
             log_store_timeline(
@@ -986,7 +1175,10 @@ class LMCacheEngine:
                     f"{(gpu_offload_step_time - layer_connector_next_time) * 1000:.4f} "
                     f"layer_connector_next_ms={layer_connector_next_time * 1000:.4f} "
                     f"yield_wait_ms={yield_resume_time * 1000:.4f} "
+                    f"put_ready_wait_ms={put_ready_wait_time * 1000:.4f} "
                     f"put_submit_ms={put_submit_time * 1000:.4f} "
+                    f"put_future_wait_ms={put_future_wait_time * 1000:.4f} "
+                    f"put_task_wall_ms={put_task_wall_time * 1000:.4f} "
                     f"active_layer_ms={layer_step_time * 1000:.4f} "
                     f"other_ms={pipeline_other_time * 1000:.4f}"
                 ),
@@ -995,7 +1187,8 @@ class LMCacheEngine:
                 "[req_id=%s] Stored %d out of total %d tokens. "
                 "size: %.4f GB, cost %.4f ms, "
                 "io_time %.4f ms, gpu_offload_step_time %.4f ms, "
-                "put_submit_time %.4f ms, wall_time %.4f ms, "
+                "put_ready_wait_time %.4f ms, put_submit_time %.4f ms, "
+                "put_future_wait_time %.4f ms, wall_time %.4f ms, "
                 "throughput: %.4f GB/s",
                 req_id,
                 tot_token_num,
@@ -1004,7 +1197,9 @@ class LMCacheEngine:
                 io_time * 1000,
                 io_time * 1000,
                 gpu_offload_step_time * 1000,
+                put_ready_wait_time * 1000,
                 put_submit_time * 1000,
+                put_future_wait_time * 1000,
                 wall_time * 1000,
                 tot_kv_size / io_time / 1024**3 if io_time > 0 else 0,
             )
@@ -1013,7 +1208,9 @@ class LMCacheEngine:
                 "chunks=%d, prepare_time=%.4f ms, contains_time=%.4f ms, "
                 "allocation_time=%.4f ms, prepare_other_time=%.4f ms, "
                 "remote_prepare_layers=%d, remote_prepare_submit_time=%.4f ms, "
-                "yield_resume_time=%.4f ms, pipeline_other_time=%.4f ms, "
+                "yield_resume_time=%.4f ms, put_ready_wait_time=%.4f ms, "
+                "put_submit_time=%.4f ms, put_future_wait_time=%.4f ms, "
+                "put_task_wall_time=%.4f ms, pipeline_other_time=%.4f ms, "
                 "total_time=%.4f ms",
                 req_id,
                 len(starts),
@@ -1024,6 +1221,10 @@ class LMCacheEngine:
                 remote_prepare_layers,
                 remote_prepare_submit_time * 1000,
                 yield_resume_time * 1000,
+                put_ready_wait_time * 1000,
+                put_submit_time * 1000,
+                put_future_wait_time * 1000,
+                put_task_wall_time * 1000,
                 pipeline_other_time * 1000,
                 (wall_end - prepare_start) * 1000,
             )
@@ -1947,6 +2148,15 @@ class LMCacheEngine:
                 logger.info("lmcache_worker closed successfully")
             except Exception as e:
                 logger.error(f"Error closing lmcache_worker: {e}")
+
+        if self._layerwise_put_executor is not None:
+            try:
+                logger.info("Closing layerwise put executor...")
+                self._layerwise_put_executor.shutdown(wait=True)
+                self._layerwise_put_executor = None
+                logger.info("layerwise put executor closed successfully")
+            except Exception as e:
+                logger.error(f"Error closing layerwise put executor: {e}")
 
         try:
             logger.info("Closing storage_manager...")

@@ -3,8 +3,9 @@
 import abc
 import os
 import statistics
+import threading
 import time
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 # Third Party
 import torch
@@ -39,6 +40,15 @@ if torch.cuda.is_available():
     import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+
+class LayerwiseOffloadHandle:
+    def __init__(self, layer_id: int, wait_fn: Callable[[], None]) -> None:
+        self.layer_id = layer_id
+        self._wait_fn = wait_fn
+
+    def wait(self) -> None:
+        self._wait_fn()
 
 
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
@@ -1072,7 +1082,16 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
 
         self.load_stream = torch.cuda.Stream()
-        self.store_stream = torch.cuda.Stream()
+        self.layerwise_store_stream_count = int(
+            os.getenv("LMCACHE_LAYERWISE_STORE_STREAMS", "1")
+        )
+        if self.layerwise_store_stream_count < 1:
+            raise ValueError("LMCACHE_LAYERWISE_STORE_STREAMS must be positive")
+        self.store_streams = [
+            torch.cuda.Stream(device=self.device)
+            for _ in range(self.layerwise_store_stream_count)
+        ]
+        self.store_stream = self.store_streams[0]
         self.chunk_copy_stream_count = int(
             os.getenv("LMCACHE_CHUNK_COPY_STREAMS", "64")
         )
@@ -1154,12 +1173,22 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 kv_caches, self.gpu_kv_format
             )
             logger.info(
-                f"Lazily initializing GPU buffer (max tokens={self.tokens_per_layer})."
+                "Lazily initializing GPU buffer "
+                f"(max tokens={self.tokens_per_layer}, "
+                f"store_streams={self.layerwise_store_stream_count})."
             )
-            gpu_buffer_size = self.elements_per_layer * self.element_size
+            gpu_buffer_size = (
+                self.elements_per_layer
+                * self.element_size
+                * self.layerwise_store_stream_count
+            )
             self.gpu_buffer_allocator = GPUMemoryAllocator(
                 gpu_buffer_size, device=self.device
             )
+
+    def _select_layerwise_store_stream(self, layer_id: int) -> tuple[int, torch.cuda.Stream]:
+        stream_id = (layer_id * 2654435761) % self.layerwise_store_stream_count
+        return stream_id, self.store_streams[stream_id]
 
     def _replace_with_cpu_staging_views(
         self,
@@ -1412,18 +1441,21 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         num_tokens = len(slot_mapping_full)
         buffer_shape = self.get_shape(num_tokens)
 
-        tmp_gpu_buffer_obj: Optional[MemoryObj] = None
-        tmp_gpu_buffer_tensor: Optional[torch.Tensor] = None
+        tmp_gpu_buffer_objs: list[MemoryObj] = []
+        tmp_gpu_buffer_tensors: list[torch.Tensor] = []
         if self.use_gpu:
             assert self.gpu_buffer_allocator is not None
-            tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
-                buffer_shape, self.dtype, MemoryFormat.KV_T2D
-            )
-            assert tmp_gpu_buffer_obj is not None, (
-                "Failed to allocate GPU buffer in GPUConnector"
-            )
-            tmp_gpu_buffer_tensor = tmp_gpu_buffer_obj.tensor
-            assert tmp_gpu_buffer_tensor is not None
+            for _ in range(self.layerwise_store_stream_count):
+                tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+                    buffer_shape, self.dtype, MemoryFormat.KV_T2D
+                )
+                assert tmp_gpu_buffer_obj is not None, (
+                    "Failed to allocate GPU buffer in GPUConnector"
+                )
+                tmp_gpu_buffer_tensor = tmp_gpu_buffer_obj.tensor
+                assert tmp_gpu_buffer_tensor is not None
+                tmp_gpu_buffer_objs.append(tmp_gpu_buffer_obj)
+                tmp_gpu_buffer_tensors.append(tmp_gpu_buffer_tensor)
 
         destination_is_pinned: Optional[bool] = None
         destination_is_contiguous: Optional[bool] = None
@@ -1461,40 +1493,30 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             os.environ.get("PD_BACKEND_LAYER_TIMING") == "1"
             or os.environ.get("PD_BACKEND_CONNECTOR_TIMELINE") == "1"
         )
-        layer_start_event = (
-            torch.cuda.Event(enable_timing=True) if gpu_timing else None
-        )
-        gather_start_event = (
-            torch.cuda.Event(enable_timing=True) if gpu_timing else None
-        )
-        gather_end_event = (
-            torch.cuda.Event(enable_timing=True) if gpu_timing else None
-        )
-        d2h_end_event = (
-            torch.cuda.Event(enable_timing=True) if gpu_timing else None
-        )
-        copy_ready_event = (
-            torch.cuda.Event() if self.use_gpu and not use_cpu_staging else None
-        )
         num_chunks_per_layer = len(memory_objs[0]) if memory_objs else 0
         effective_copy_stream_count = min(
             self.chunk_copy_stream_count, num_chunks_per_layer
         )
-        used_copy_streams = self.chunk_copy_streams[
-            :effective_copy_stream_count
-        ]
-        pending_advance_start: Optional[float] = None
-        pending_put_layer: Optional[int] = None
-        pending_sync_wait_time = 0.0
-        pending_stream_dependency_gpu_time_ms = 0.0
-        pending_gather_gpu_time_ms = 0.0
-        pending_d2h_gpu_time_ms = 0.0
-        pending_staging_view_time = 0.0
-        pending_staging_rebind_time = 0.0
-        pending_staging_free_time = 0.0
+        active_copy_stream_count = (
+            effective_copy_stream_count if self.use_gpu and not use_cpu_staging else 0
+        )
+        offload_handles: list[LayerwiseOffloadHandle] = []
+        timing_lock = threading.Lock()
+
+        def select_layer_copy_streams(store_stream_id: int) -> list[torch.cuda.Stream]:
+            if active_copy_stream_count == 0:
+                return []
+            stream_start = store_stream_id * active_copy_stream_count
+            return [
+                self.chunk_copy_streams[
+                    (stream_start + offset) % self.chunk_copy_stream_count
+                ]
+                for offset in range(active_copy_stream_count)
+            ]
 
         def log_connector_advance(
             put_layer: int,
+            store_stream_id: int,
             advance_start: float,
             advance_end: float,
             sync_wait: float,
@@ -1522,7 +1544,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 return
             logger.info(
                 "[pd-demo-connector-advance] req_id=%s put_layer=%d "
-                "next_enqueue_layer=%d wall_ms=%.4f sync_wait_ms=%.4f "
+                "store_stream_id=%d next_enqueue_layer=%d "
+                "wall_ms=%.4f sync_wait_ms=%.4f "
                 "stream_dependency_gpu_ms=%.4f gather_gpu_ms=%.4f "
                 "d2h_gpu_ms=%.4f next_enqueue_wall_ms=%.4f "
                 "wait_stream_call_ms=%.4f gather_call_ms=%.4f "
@@ -1535,6 +1558,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 "cpu_staging=%s copy_streams=%d sync=%s",
                 kwargs.get("req_id"),
                 put_layer,
+                store_stream_id,
                 next_enqueue_layer,
                 (advance_end - advance_start) * 1000,
                 sync_wait * 1000,
@@ -1557,12 +1581,35 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 staging_rebind * 1000,
                 staging_free * 1000,
                 use_cpu_staging,
-                0 if use_cpu_staging else effective_copy_stream_count,
+                active_copy_stream_count,
                 sync,
             )
 
         for layer_id in range(self.num_layers):
             enqueue_start = time.perf_counter()
+            store_stream_id, selected_store_stream = (
+                self._select_layerwise_store_stream(layer_id)
+            )
+            selected_copy_streams = select_layer_copy_streams(store_stream_id)
+            tmp_gpu_buffer_tensor = (
+                tmp_gpu_buffer_tensors[store_stream_id] if self.use_gpu else None
+            )
+            layer_start_event = (
+                torch.cuda.Event(enable_timing=True) if gpu_timing else None
+            )
+            gather_start_event = (
+                torch.cuda.Event(enable_timing=True) if gpu_timing else None
+            )
+            gather_end_event = (
+                torch.cuda.Event(enable_timing=True) if gpu_timing else None
+            )
+            d2h_end_event = (
+                torch.cuda.Event(enable_timing=True) if gpu_timing else None
+            )
+            ready_event = torch.cuda.Event(enable_timing=gpu_timing)
+            copy_ready_event = (
+                torch.cuda.Event() if self.use_gpu and not use_cpu_staging else None
+            )
             layer_cpu_staging_allocation_time = 0.0
             layer_wait_stream_call_time = 0.0
             layer_gather_call_time = 0.0
@@ -1590,18 +1637,20 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     destination_is_pinned = cpu_staging_tensor.is_pinned()
                     destination_is_contiguous = cpu_staging_tensor.is_contiguous()
                     source_is_contiguous = cpu_staging_tensor.is_contiguous()
+
             # kvcaches -> gpu_buffer -> memobj
-            with torch.cuda.stream(self.store_stream):
+            with torch.cuda.stream(selected_store_stream):
                 if layer_start_event is not None:
-                    layer_start_event.record(self.store_stream)
+                    layer_start_event.record(selected_store_stream)
                 wait_stream_start = time.perf_counter()
-                self.store_stream.wait_stream(current_stream)
+                selected_store_stream.wait_stream(current_stream)
                 wait_stream_elapsed = time.perf_counter() - wait_stream_start
                 wait_stream_call_time += wait_stream_elapsed
                 layer_wait_stream_call_time += wait_stream_elapsed
                 if gather_start_event is not None:
-                    gather_start_event.record(self.store_stream)
+                    gather_start_event.record(selected_store_stream)
                 if self.use_gpu:
+                    assert tmp_gpu_buffer_tensor is not None
                     gather_call_start = time.perf_counter()
                     lmc_ops.single_layer_kv_transfer(
                         tmp_gpu_buffer_tensor,
@@ -1615,9 +1664,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     gather_call_time += gather_call_elapsed
                     layer_gather_call_time += gather_call_elapsed
                 if gather_end_event is not None:
-                    gather_end_event.record(self.store_stream)
+                    gather_end_event.record(selected_store_stream)
                 if copy_ready_event is not None:
-                    copy_ready_event.record(self.store_stream)
+                    copy_ready_event.record(selected_store_stream)
                 chunk_copy_loop_start = time.perf_counter()
                 if use_cpu_staging:
                     assert tmp_gpu_buffer_tensor is not None
@@ -1641,35 +1690,27 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         tensor_view_start = time.perf_counter()
                         destination = memory_obj.tensor
                         assert destination is not None
-                        source = tmp_gpu_buffer_tensor[
-                            start - offset : end - offset
-                        ]
+                        source = tmp_gpu_buffer_tensor[start - offset : end - offset]
                         tensor_view_elapsed = time.perf_counter() - tensor_view_start
                         tensor_view_time += tensor_view_elapsed
                         layer_tensor_view_time += tensor_view_elapsed
                         if destination_is_pinned is None:
                             destination_is_pinned = destination.is_pinned()
-                            destination_is_contiguous = (
-                                destination.is_contiguous()
-                            )
+                            destination_is_contiguous = destination.is_contiguous()
                             source_is_contiguous = source.is_contiguous()
-                        copy_stream = used_copy_streams[
-                            chunk_id % effective_copy_stream_count
+                        copy_stream = selected_copy_streams[
+                            chunk_id % active_copy_stream_count
                         ]
                         stream_context_start = time.perf_counter()
                         with torch.cuda.stream(copy_stream):
                             wait_event_start = time.perf_counter()
                             copy_stream.wait_event(copy_ready_event)
-                            wait_event_time = (
-                                time.perf_counter() - wait_event_start
-                            )
+                            wait_event_time = time.perf_counter() - wait_event_start
                             copy_wait_event_call_time += wait_event_time
                             layer_copy_wait_event_call_time += wait_event_time
                             copy_call_start = time.perf_counter()
                             destination.copy_(source, non_blocking=True)
-                            copy_call_time = (
-                                time.perf_counter() - copy_call_start
-                            )
+                            copy_call_time = time.perf_counter() - copy_call_start
                             copy_call_times.append(copy_call_time)
                             layer_copy_call_time += copy_call_time
                             layer_copy_count += 1
@@ -1684,15 +1725,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         )
                         copy_stream_context_other_time += max(
                             0.0,
-                            stream_context_time
-                            - wait_event_time
-                            - copy_call_time,
+                            stream_context_time - wait_event_time - copy_call_time,
                         )
                         layer_copy_stream_context_other_time += max(
                             0.0,
-                            stream_context_time
-                            - wait_event_time
-                            - copy_call_time,
+                            stream_context_time - wait_event_time - copy_call_time,
                         )
                         if self.use_mla:
                             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
@@ -1719,164 +1756,154 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 chunk_copy_loop_elapsed = time.perf_counter() - chunk_copy_loop_start
                 chunk_copy_loop_time += chunk_copy_loop_elapsed
                 layer_chunk_copy_loop_time += chunk_copy_loop_elapsed
-                if not use_cpu_staging:
+                if active_copy_stream_count:
                     copy_stream_join_start = time.perf_counter()
-                    for copy_stream in used_copy_streams:
-                        self.store_stream.wait_stream(copy_stream)
+                    for copy_stream in selected_copy_streams:
+                        selected_store_stream.wait_stream(copy_stream)
                     copy_stream_join_elapsed = (
                         time.perf_counter() - copy_stream_join_start
                     )
                     copy_stream_join_call_time += copy_stream_join_elapsed
                     layer_copy_stream_join_call_time += copy_stream_join_elapsed
                 if d2h_end_event is not None:
-                    d2h_end_event.record(self.store_stream)
+                    d2h_end_event.record(selected_store_stream)
+                ready_event.record(selected_store_stream)
 
             enqueue_end = time.perf_counter()
-            if layer_id == 0:
-                log_connector_advance(
-                    put_layer=-1,
-                    advance_start=setup_start,
-                    advance_end=enqueue_end,
-                    sync_wait=0.0,
-                    stream_dependency_ms=0.0,
-                    gather_gpu_ms=0.0,
-                    d2h_gpu_ms=0.0,
-                    next_enqueue_layer=layer_id,
-                    enqueue_wall=enqueue_end - enqueue_start,
-                    wait_stream_call=layer_wait_stream_call_time,
-                    gather_call=layer_gather_call_time,
-                    chunk_copy_loop=layer_chunk_copy_loop_time,
-                    tensor_view=layer_tensor_view_time,
-                    copy_wait_event_call=layer_copy_wait_event_call_time,
-                    copy_call=layer_copy_call_time,
-                    copy_stream_context_other=layer_copy_stream_context_other_time,
-                    copy_stream_join_call=layer_copy_stream_join_call_time,
-                    copy_count=layer_copy_count,
-                    staging_allocation=layer_cpu_staging_allocation_time,
-                    staging_submit=layer_staging_d2h_submit_time,
-                    staging_view=0.0,
-                    staging_rebind=0.0,
-                    staging_free=0.0,
-                )
-            elif pending_advance_start is not None and pending_put_layer is not None:
-                log_connector_advance(
-                    put_layer=pending_put_layer,
-                    advance_start=pending_advance_start,
-                    advance_end=enqueue_end,
-                    sync_wait=pending_sync_wait_time,
-                    stream_dependency_ms=pending_stream_dependency_gpu_time_ms,
-                    gather_gpu_ms=pending_gather_gpu_time_ms,
-                    d2h_gpu_ms=pending_d2h_gpu_time_ms,
-                    next_enqueue_layer=layer_id,
-                    enqueue_wall=enqueue_end - enqueue_start,
-                    wait_stream_call=layer_wait_stream_call_time,
-                    gather_call=layer_gather_call_time,
-                    chunk_copy_loop=layer_chunk_copy_loop_time,
-                    tensor_view=layer_tensor_view_time,
-                    copy_wait_event_call=layer_copy_wait_event_call_time,
-                    copy_call=layer_copy_call_time,
-                    copy_stream_context_other=layer_copy_stream_context_other_time,
-                    copy_stream_join_call=layer_copy_stream_join_call_time,
-                    copy_count=layer_copy_count,
-                    staging_allocation=layer_cpu_staging_allocation_time,
-                    staging_submit=layer_staging_d2h_submit_time,
-                    staging_view=pending_staging_view_time,
-                    staging_rebind=pending_staging_rebind_time,
-                    staging_free=pending_staging_free_time,
-                )
 
-            yield
-            resume_start = time.perf_counter()
-            layer_sync_wait_time = 0.0
-            layer_stream_dependency_gpu_time_ms = 0.0
-            layer_gather_gpu_time_ms = 0.0
-            layer_d2h_gpu_time_ms = 0.0
-            if sync:
-                sync_start = time.perf_counter()
-                self.store_stream.synchronize()
-                layer_sync_wait_time = time.perf_counter() - sync_start
-                sync_wait_time += layer_sync_wait_time
-                assert layer_start_event is not None
-                assert gather_start_event is not None
-                assert gather_end_event is not None
-                assert d2h_end_event is not None
-                layer_stream_dependency_gpu_time_ms = (
-                    layer_start_event.elapsed_time(gather_start_event)
-                )
-                layer_gather_gpu_time_ms = gather_start_event.elapsed_time(
-                    gather_end_event
-                )
-                layer_d2h_gpu_time_ms = gather_end_event.elapsed_time(d2h_end_event)
-                stream_dependency_gpu_time_ms += (
-                    layer_stream_dependency_gpu_time_ms
-                )
-                gather_gpu_time_ms += layer_gather_gpu_time_ms
-                d2h_gpu_time_ms += layer_d2h_gpu_time_ms
-            layer_staging_view_time = 0.0
-            layer_staging_rebind_time = 0.0
-            layer_staging_free_time = 0.0
-            if use_cpu_staging:
-                assert cpu_staging_tensor is not None
-                (
-                    view_creation_time,
-                    object_rebind_time,
-                    old_buffer_free_time,
-                ) = self._replace_with_cpu_staging_views(
-                    memory_objs_layer,
-                    cpu_staging_tensor,
-                    staging_starts,
-                    staging_ends,
-                )
-                layer_staging_view_time = view_creation_time
-                layer_staging_rebind_time = object_rebind_time
-                layer_staging_free_time = old_buffer_free_time
-                cpu_view_count += len(memory_objs_layer)
-                cpu_view_creation_time += view_creation_time
-                cpu_object_rebind_time += object_rebind_time
-                cpu_old_buffer_free_time += old_buffer_free_time
-            pending_advance_start = resume_start
-            pending_put_layer = layer_id
-            pending_sync_wait_time = layer_sync_wait_time
-            pending_stream_dependency_gpu_time_ms = (
-                layer_stream_dependency_gpu_time_ms
-            )
-            pending_gather_gpu_time_ms = layer_gather_gpu_time_ms
-            pending_d2h_gpu_time_ms = layer_d2h_gpu_time_ms
-            pending_staging_view_time = layer_staging_view_time
-            pending_staging_rebind_time = layer_staging_rebind_time
-            pending_staging_free_time = layer_staging_free_time
-            logger.debug(f"Finished offloading layer {layer_id}")
+            def make_wait_fn(
+                *,
+                put_layer: int = layer_id,
+                layer_store_stream_id: int = store_stream_id,
+                layer_ready_event: torch.cuda.Event = ready_event,
+                start_event: Optional[torch.cuda.Event] = layer_start_event,
+                gather_start: Optional[torch.cuda.Event] = gather_start_event,
+                gather_end: Optional[torch.cuda.Event] = gather_end_event,
+                d2h_end: Optional[torch.cuda.Event] = d2h_end_event,
+                layer_memory_objs: list[MemoryObj] = memory_objs_layer,
+                staging_tensor: Optional[torch.Tensor] = cpu_staging_tensor,
+                enqueue_wall: float = enqueue_end - enqueue_start,
+                wait_stream_call: float = layer_wait_stream_call_time,
+                gather_call: float = layer_gather_call_time,
+                chunk_copy_loop: float = layer_chunk_copy_loop_time,
+                tensor_view: float = layer_tensor_view_time,
+                copy_wait_event_call: float = layer_copy_wait_event_call_time,
+                copy_call: float = layer_copy_call_time,
+                copy_stream_context_other: float = (
+                    layer_copy_stream_context_other_time
+                ),
+                copy_stream_join_call: float = layer_copy_stream_join_call_time,
+                copy_count: int = layer_copy_count,
+                staging_allocation: float = layer_cpu_staging_allocation_time,
+                staging_submit: float = layer_staging_d2h_submit_time,
+            ) -> Callable[[], None]:
+                waited = False
 
-        if pending_advance_start is not None and pending_put_layer is not None:
-            log_connector_advance(
-                put_layer=pending_put_layer,
-                advance_start=pending_advance_start,
-                advance_end=time.perf_counter(),
-                sync_wait=pending_sync_wait_time,
-                stream_dependency_ms=pending_stream_dependency_gpu_time_ms,
-                gather_gpu_ms=pending_gather_gpu_time_ms,
-                d2h_gpu_ms=pending_d2h_gpu_time_ms,
-                next_enqueue_layer=-1,
-                enqueue_wall=0.0,
-                wait_stream_call=0.0,
-                gather_call=0.0,
-                chunk_copy_loop=0.0,
-                tensor_view=0.0,
-                copy_wait_event_call=0.0,
-                copy_call=0.0,
-                copy_stream_context_other=0.0,
-                copy_stream_join_call=0.0,
-                copy_count=0,
-                staging_allocation=0.0,
-                staging_submit=0.0,
-                staging_view=pending_staging_view_time,
-                staging_rebind=pending_staging_rebind_time,
-                staging_free=pending_staging_free_time,
-            )
+                def wait_ready() -> None:
+                    nonlocal waited
+                    nonlocal sync_wait_time
+                    nonlocal stream_dependency_gpu_time_ms
+                    nonlocal gather_gpu_time_ms
+                    nonlocal d2h_gpu_time_ms
+                    nonlocal cpu_view_count
+                    nonlocal cpu_view_creation_time
+                    nonlocal cpu_object_rebind_time
+                    nonlocal cpu_old_buffer_free_time
+                    if waited:
+                        return
+
+                    ready_wait_start = time.perf_counter()
+                    with torch.cuda.device(self.device):
+                        layer_ready_event.synchronize()
+                    layer_ready_wait_time = time.perf_counter() - ready_wait_start
+                    layer_stream_dependency_gpu_time_ms = 0.0
+                    layer_gather_gpu_time_ms = 0.0
+                    layer_d2h_gpu_time_ms = 0.0
+                    if gpu_timing:
+                        assert start_event is not None
+                        assert gather_start is not None
+                        assert gather_end is not None
+                        assert d2h_end is not None
+                        layer_stream_dependency_gpu_time_ms = (
+                            start_event.elapsed_time(gather_start)
+                        )
+                        layer_gather_gpu_time_ms = gather_start.elapsed_time(gather_end)
+                        layer_d2h_gpu_time_ms = gather_end.elapsed_time(d2h_end)
+
+                    layer_staging_view_time = 0.0
+                    layer_staging_rebind_time = 0.0
+                    layer_staging_free_time = 0.0
+                    if use_cpu_staging:
+                        assert staging_tensor is not None
+                        (
+                            view_creation_time,
+                            object_rebind_time,
+                            old_buffer_free_time,
+                        ) = self._replace_with_cpu_staging_views(
+                            layer_memory_objs,
+                            staging_tensor,
+                            staging_starts,
+                            staging_ends,
+                        )
+                        layer_staging_view_time = view_creation_time
+                        layer_staging_rebind_time = object_rebind_time
+                        layer_staging_free_time = old_buffer_free_time
+
+                    ready_wait_end = time.perf_counter()
+                    with timing_lock:
+                        sync_wait_time += layer_ready_wait_time
+                        stream_dependency_gpu_time_ms += (
+                            layer_stream_dependency_gpu_time_ms
+                        )
+                        gather_gpu_time_ms += layer_gather_gpu_time_ms
+                        d2h_gpu_time_ms += layer_d2h_gpu_time_ms
+                        if use_cpu_staging:
+                            cpu_view_count += len(layer_memory_objs)
+                        cpu_view_creation_time += layer_staging_view_time
+                        cpu_object_rebind_time += layer_staging_rebind_time
+                        cpu_old_buffer_free_time += layer_staging_free_time
+                    log_connector_advance(
+                        put_layer=put_layer,
+                        store_stream_id=layer_store_stream_id,
+                        advance_start=ready_wait_start,
+                        advance_end=ready_wait_end,
+                        sync_wait=layer_ready_wait_time,
+                        stream_dependency_ms=layer_stream_dependency_gpu_time_ms,
+                        gather_gpu_ms=layer_gather_gpu_time_ms,
+                        d2h_gpu_ms=layer_d2h_gpu_time_ms,
+                        next_enqueue_layer=put_layer,
+                        enqueue_wall=enqueue_wall,
+                        wait_stream_call=wait_stream_call,
+                        gather_call=gather_call,
+                        chunk_copy_loop=chunk_copy_loop,
+                        tensor_view=tensor_view,
+                        copy_wait_event_call=copy_wait_event_call,
+                        copy_call=copy_call,
+                        copy_stream_context_other=copy_stream_context_other,
+                        copy_stream_join_call=copy_stream_join_call,
+                        copy_count=copy_count,
+                        staging_allocation=staging_allocation,
+                        staging_submit=staging_submit,
+                        staging_view=layer_staging_view_time,
+                        staging_rebind=layer_staging_rebind_time,
+                        staging_free=layer_staging_free_time,
+                    )
+                    logger.debug(f"Finished offloading layer {put_layer}")
+                    waited = True
+
+                return wait_ready
+
+            offload_handle = LayerwiseOffloadHandle(layer_id, make_wait_fn())
+            offload_handles.append(offload_handle)
+            yield offload_handle
+
+        for offload_handle in offload_handles:
+            offload_handle.wait()
 
         logger.info(
             "[req_id=%s] Layerwise offload breakdown: "
-            "layers=%d, chunks_per_layer=%d, copy_streams=%d, cpu_staging=%s, "
+            "layers=%d, chunks_per_layer=%d, store_streams=%d, "
+            "copy_streams=%d, cpu_staging=%s, "
             "setup_time=%.4f ms, "
             "wait_stream_call_time=%.4f ms, gather_call_time=%.4f ms, "
             "chunk_copy_loop_time=%.4f ms, sync_wait_time=%.4f ms, "
@@ -1885,7 +1912,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             kwargs.get("req_id"),
             self.num_layers,
             num_chunks_per_layer,
-            0 if use_cpu_staging else effective_copy_stream_count,
+            self.layerwise_store_stream_count,
+            active_copy_stream_count,
             use_cpu_staging,
             setup_time * 1000,
             wait_stream_call_time * 1000,
@@ -1964,7 +1992,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         )
 
         # free the buffer memory
-        if tmp_gpu_buffer_obj is not None:
+        for tmp_gpu_buffer_obj in tmp_gpu_buffer_objs:
             tmp_gpu_buffer_obj.ref_count_down()
 
         yield
