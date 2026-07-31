@@ -62,6 +62,7 @@ from lmcache.v1.token_database import (
     ChunkedTokenDatabase,
     SegmentTokenDatabase,
     TokenDatabase,
+    extract_lookup_chunk_lengths,
 )
 
 logger = init_logger(__name__)
@@ -1422,11 +1423,17 @@ class LMCacheEngine:
 
         res = 0
         try:
+            lookup_chunk_lengths = (
+                extract_lookup_chunk_lengths(request_configs)
+                if tokens is not None
+                else None
+            )
             chunk_info_iterator = self.token_database.process_tokens(
                 tokens=tokens,
                 hashes=hashes,
                 offsets=offsets,
                 request_configs=request_configs,
+                lookup_chunk_lengths=lookup_chunk_lengths,
             )
 
             # TODO: support batched_contains when layerwise is enabled

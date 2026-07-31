@@ -11,6 +11,7 @@ from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.token_database import extract_lookup_chunk_lengths
 
 logger = init_logger(__name__)
 
@@ -61,7 +62,9 @@ class LMCacheBypassLookupClient(LookupClientInterface):
                 hashes = []
                 offsets = []
                 for start, end, key in self.token_database.process_tokens(
-                    token_ids, make_key=False
+                    token_ids,
+                    make_key=False,
+                    lookup_chunk_lengths=extract_lookup_chunk_lengths(request_configs),
                 ):
                     hashes.append(key)
                     offsets.append(end - start)

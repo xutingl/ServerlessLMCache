@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 # Third Party
 import msgspec
@@ -19,7 +19,7 @@ class LookupRequestMsg(AsyncLookupMsg):
     lookup_id: str
     hashes: list[int]
     offsets: list[int]
-    request_configs: Optional[Dict[str, str]] = None
+    request_configs: Optional[Dict[str, Any]] = None
 
     def describe(self) -> str:
         return (

@@ -17,6 +17,7 @@ from lmcache.v1.rpc.transport import (
     RpcClientTransport,
     RpcServerTransport,
 )
+from lmcache.v1.token_database import extract_lookup_chunk_lengths
 
 logger = init_logger(__name__)
 
@@ -104,7 +105,11 @@ class LMCacheLookupClient(LookupClientInterface):
                 start,
                 end,
                 key,
-            ) in self.token_database.process_tokens(token_ids, make_key=False):
+            ) in self.token_database.process_tokens(
+                token_ids,
+                make_key=False,
+                lookup_chunk_lengths=extract_lookup_chunk_lengths(request_configs),
+            ):
                 hashes.append(key)
                 offsets.append(end - start)
 

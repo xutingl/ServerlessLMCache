@@ -25,6 +25,7 @@ from lmcache.v1.rpc_utils import (
     get_zmq_rpc_path_lmcache,
     get_zmq_socket,
 )
+from lmcache.v1.token_database import extract_lookup_chunk_lengths
 
 logger = init_logger(__name__)
 
@@ -199,7 +200,9 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
         hashes: list[int] = []
         offsets = []
         for start, end, hash_val in self.token_database.process_tokens(
-            token_ids, make_key=False
+            token_ids,
+            make_key=False,
+            lookup_chunk_lengths=extract_lookup_chunk_lengths(request_configs),
         ):
             hashes.append(hash_val)  # type: ignore[arg-type]
             offsets.append(end - start)
