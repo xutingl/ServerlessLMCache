@@ -35,13 +35,17 @@ NONE_HASH = 0
 # (start_index, end_index, cache_engine_key｜hash)
 ProcessTokensResult = Tuple[int, int, Union[CacheEngineKey, int]]
 LOOKUP_CHUNK_LENGTHS_CONFIG = "lmcache.lookup_chunk_lengths"
+SAVE_CHUNK_LENGTHS_CONFIG = "lmcache.save_chunk_lengths"
 
 
-def extract_lookup_chunk_lengths(request_configs: Optional[dict]) -> Optional[list[int]]:
+def extract_chunk_lengths(
+    request_configs: Optional[dict],
+    config_name: str,
+) -> Optional[list[int]]:
     if not request_configs:
         return None
 
-    value = request_configs.get(LOOKUP_CHUNK_LENGTHS_CONFIG)
+    value = request_configs.get(config_name)
     if value is None:
         return None
 
@@ -55,26 +59,18 @@ def extract_lookup_chunk_lengths(request_configs: Optional[dict]) -> Optional[li
             value = [part.strip() for part in value.split(",") if part.strip()]
 
     if not isinstance(value, (list, tuple)):
-        raise ValueError(
-            f"{LOOKUP_CHUNK_LENGTHS_CONFIG} must be a list of positive integers"
-        )
+        raise ValueError(f"{config_name} must be a list of positive integers")
 
     lengths = []
     for item in value:
         if isinstance(item, bool):
-            raise ValueError(
-                f"{LOOKUP_CHUNK_LENGTHS_CONFIG} must not contain booleans"
-            )
+            raise ValueError(f"{config_name} must not contain booleans")
         try:
             length = int(item)
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"{LOOKUP_CHUNK_LENGTHS_CONFIG} must contain only integers"
-            ) from exc
+            raise ValueError(f"{config_name} must contain only integers") from exc
         if length <= 0:
-            raise ValueError(
-                f"{LOOKUP_CHUNK_LENGTHS_CONFIG} values must be positive"
-            )
+            raise ValueError(f"{config_name} values must be positive")
         lengths.append(length)
 
     return lengths or None
@@ -221,7 +217,8 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
         request_configs: Optional[dict] = None,
-        lookup_chunk_lengths: Optional[list[int]] = None,
+        chunk_lengths: Optional[list[int]] = None,
+        chunk_lengths_config_name: str = "chunk_lengths",
     ) -> Iterable[ProcessTokensResult]:
         """Process the tokens and return the corresponding cache engine keys.
 
@@ -381,20 +378,21 @@ class ChunkedTokenDatabase(TokenDatabase):
             prefix_hash = self._hash_tokens(token_chunk, prefix_hash)
             yield prefix_hash
 
-    def _process_lookup_chunks(
+    def _process_custom_chunks(
         self,
         tokens: Union[torch.Tensor, List[int]],
         chunk_lengths: list[int],
         num_falses: int,
         request_configs: Optional[dict],
         make_key: bool,
+        config_name: str,
     ) -> Iterable[ProcessTokensResult]:
         total_len = len(tokens)
-        total_lookup_len = sum(chunk_lengths)
-        if total_lookup_len > total_len:
+        total_custom_len = sum(chunk_lengths)
+        if total_custom_len > total_len:
             raise ValueError(
-                f"{LOOKUP_CHUNK_LENGTHS_CONFIG} sum exceeds token length: "
-                f"{total_lookup_len} > {total_len}"
+                f"{config_name} sum exceeds token length: "
+                f"{total_custom_len} > {total_len}"
             )
 
         prefix_hash = self._get_init_hash()
@@ -406,7 +404,7 @@ class ChunkedTokenDatabase(TokenDatabase):
             if start_idx < num_falses < end_idx:
                 raise ValueError(
                     "The number of Falses in the mask must align with "
-                    f"{LOOKUP_CHUNK_LENGTHS_CONFIG} boundaries."
+                    f"{config_name} boundaries."
                 )
 
             if start_idx >= num_falses:
@@ -430,7 +428,8 @@ class ChunkedTokenDatabase(TokenDatabase):
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
         request_configs: Optional[dict] = None,
-        lookup_chunk_lengths: Optional[list[int]] = None,
+        chunk_lengths: Optional[list[int]] = None,
+        chunk_lengths_config_name: str = "chunk_lengths",
     ) -> Iterable[ProcessTokensResult]:
         """Process the tokens/hashes and return the corresponding cache engine keys.
 
@@ -464,20 +463,21 @@ class ChunkedTokenDatabase(TokenDatabase):
         else:
             num_falses = 0
 
-        if lookup_chunk_lengths is None and num_falses % self.chunk_size != 0:
+        if chunk_lengths is None and num_falses % self.chunk_size != 0:
             raise ValueError(
                 "The number of Falses in the mask is not a multiple of the chunk size."
             )
 
         if tokens is not None:
             total_len = len(tokens)
-            if lookup_chunk_lengths is not None:
-                yield from self._process_lookup_chunks(
+            if chunk_lengths is not None:
+                yield from self._process_custom_chunks(
                     tokens,
-                    lookup_chunk_lengths,
+                    chunk_lengths,
                     num_falses,
                     request_configs,
                     make_key,
+                    chunk_lengths_config_name,
                 )
                 return
 
@@ -566,7 +566,8 @@ class SegmentTokenDatabase(TokenDatabase):
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
         request_configs: Optional[dict] = None,
-        lookup_chunk_lengths: Optional[list[int]] = None,
+        chunk_lengths: Optional[list[int]] = None,
+        chunk_lengths_config_name: str = "chunk_lengths",
     ) -> Iterable[ProcessTokensResult]:
         """Process the tokens and return the corresponding cache engine keys.
 
@@ -594,9 +595,9 @@ class SegmentTokenDatabase(TokenDatabase):
 
         """
 
-        if lookup_chunk_lengths is not None:
+        if chunk_lengths is not None:
             raise ValueError(
-                f"{LOOKUP_CHUNK_LENGTHS_CONFIG} is only supported by "
+                f"{chunk_lengths_config_name} is only supported by "
                 "ChunkedTokenDatabase"
             )
 

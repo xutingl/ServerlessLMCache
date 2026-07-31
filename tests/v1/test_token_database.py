@@ -64,6 +64,73 @@ def test_chunked_token_database(chunk_length, save_unfull_chunk):
             assert ed == original_results[j + i][1]
 
 
+def test_chunked_token_database_custom_save_chunk_lengths():
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=128, backend="cpu", save_unfull_chunk=False
+    )
+    db = ChunkedTokenDatabase(cfg, dumb_metadata())
+    tokens = generate_tokens(138, "cpu")
+    chunk_lengths = [128, 2, 4, 4]
+
+    results = list(
+        db.process_tokens(
+            tokens=tokens,
+            make_key=False,
+            chunk_lengths=chunk_lengths,
+        )
+    )
+
+    assert [(start, end) for start, end, _ in results] == [
+        (0, 128),
+        (128, 130),
+        (130, 134),
+        (134, 138),
+    ]
+
+    prefix_hash = db._get_init_hash()
+    expected_hashes = []
+    for start, end in [(0, 128), (128, 130), (130, 134), (134, 138)]:
+        prefix_hash = db._hash_tokens(tokens[start:end], prefix_hash)
+        expected_hashes.append(prefix_hash)
+    assert [hash_val for _, _, hash_val in results] == expected_hashes
+
+
+def test_chunked_token_database_custom_save_chunk_lengths_with_mask():
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=128, backend="cpu", save_unfull_chunk=False
+    )
+    db = ChunkedTokenDatabase(cfg, dumb_metadata())
+    tokens = generate_tokens(138, "cpu")
+    chunk_lengths = [128, 2, 4, 4]
+    mask = torch.full([138], True, dtype=torch.bool, device="cpu")
+
+    mask[:130] = False
+    results = list(
+        db.process_tokens(
+            tokens=tokens,
+            mask=mask,
+            make_key=False,
+            chunk_lengths=chunk_lengths,
+        )
+    )
+    assert [(start, end) for start, end, _ in results] == [
+        (130, 134),
+        (134, 138),
+    ]
+
+    mask[:] = True
+    mask[:131] = False
+    with pytest.raises(ValueError, match="lmcache.save_chunk_lengths boundaries"):
+        list(
+            db.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                make_key=False,
+                chunk_lengths=chunk_lengths,
+            )
+        )
+
+
 @pytest.mark.parametrize("prefix_length", [0, 16, 64, 256])
 @pytest.mark.parametrize("chunk_lengths", [[256, 512, 256], [1024, 512, 256]])
 @pytest.mark.skipif(

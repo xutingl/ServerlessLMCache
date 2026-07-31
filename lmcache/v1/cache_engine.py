@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 # Standard
 import asyncio
+import copy
 import gc
 import multiprocessing
 import os
@@ -60,9 +61,11 @@ from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
     ChunkedTokenDatabase,
+    LOOKUP_CHUNK_LENGTHS_CONFIG,
+    SAVE_CHUNK_LENGTHS_CONFIG,
     SegmentTokenDatabase,
     TokenDatabase,
-    extract_lookup_chunk_lengths,
+    extract_chunk_lengths,
 )
 
 logger = init_logger(__name__)
@@ -72,6 +75,53 @@ logger = init_logger(__name__)
 ProcessedChunk = Tuple[CacheEngineKey, MemoryObj, int, int]
 # (list of processed chunks, total kv size)
 ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
+
+
+def _chunk_ids_for_spans(
+    starts: list[int],
+    ends: list[int],
+    *,
+    chunk_size: int,
+    chunk_lengths: Optional[list[int]],
+) -> list[int]:
+    if chunk_lengths is None:
+        return [start // chunk_size for start in starts]
+
+    boundaries: dict[int, tuple[int, int]] = {}
+    start = 0
+    for chunk_id, length in enumerate(chunk_lengths):
+        end = start + length
+        boundaries[start] = (chunk_id, end)
+        start = end
+
+    chunk_ids: list[int] = []
+    for span_start, span_end in zip(starts, ends, strict=False):
+        chunk_info = boundaries.get(span_start)
+        if chunk_info is None:
+            raise ValueError(
+                "Stored span does not align with custom chunk boundaries: "
+                f"start={span_start}, chunk_lengths={chunk_lengths}"
+            )
+        chunk_id, expected_end = chunk_info
+        if span_end != expected_end:
+            raise ValueError(
+                "Stored span end does not align with custom chunk boundaries: "
+                f"span=({span_start}, {span_end}), expected_end={expected_end}, "
+                f"chunk_lengths={chunk_lengths}"
+            )
+        chunk_ids.append(chunk_id)
+    return chunk_ids
+
+
+def _transfer_spec_with_chunk_ids(
+    transfer_spec: Any,
+    chunk_ids: list[int],
+) -> Any:
+    if transfer_spec is None:
+        return None
+    cloned_spec = copy.copy(transfer_spec)
+    setattr(cloned_spec, "chunk_ids", list(chunk_ids))
+    return cloned_spec
 
 
 class CacheEngineEndSignal:
@@ -457,6 +507,10 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        save_chunk_lengths = extract_chunk_lengths(
+            request_configs,
+            SAVE_CHUNK_LENGTHS_CONFIG,
+        )
 
         with store_stats.profile_process_tokens():
             prev_key = 0
@@ -466,6 +520,8 @@ class LMCacheEngine:
                 offsets,
                 mask,
                 request_configs=request_configs,
+                chunk_lengths=save_chunk_lengths,
+                chunk_lengths_config_name=SAVE_CHUNK_LENGTHS_CONFIG,
             ):
                 assert isinstance(key, CacheEngineKey)
                 # Allocate the memory object
@@ -536,7 +592,16 @@ class LMCacheEngine:
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
 
         with store_stats.profile_put():
-            transfer_spec = kwargs.get("transfer_spec", None)
+            chunk_ids = _chunk_ids_for_spans(
+                starts,
+                ends,
+                chunk_size=self.config.chunk_size,
+                chunk_lengths=save_chunk_lengths,
+            )
+            transfer_spec = _transfer_spec_with_chunk_ids(
+                kwargs.get("transfer_spec", None),
+                chunk_ids,
+            )
             # TODO: we implicitly rely on batched_put to call ref_count_down
             # this management should be done in a cleaner way
             self.storage_manager.batched_put(
@@ -676,8 +741,16 @@ class LMCacheEngine:
         contains_time = 0.0
         allocation_time = 0.0
         prev_key = 0
+        save_chunk_lengths = extract_chunk_lengths(
+            request_configs,
+            SAVE_CHUNK_LENGTHS_CONFIG,
+        )
         for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask, request_configs=request_configs
+            tokens=tokens,
+            mask=mask,
+            request_configs=request_configs,
+            chunk_lengths=save_chunk_lengths,
+            chunk_lengths_config_name=SAVE_CHUNK_LENGTHS_CONFIG,
         ):
             assert isinstance(key, CacheEngineKey)
 
@@ -772,7 +845,16 @@ class LMCacheEngine:
             )
             remote_prepare_submit_time = 0.0
             remote_prepare_layers = 0
-            transfer_spec = kwargs.get("transfer_spec")
+            chunk_ids = _chunk_ids_for_spans(
+                starts,
+                ends,
+                chunk_size=self.config.chunk_size,
+                chunk_lengths=save_chunk_lengths,
+            )
+            transfer_spec = _transfer_spec_with_chunk_ids(
+                kwargs.get("transfer_spec"),
+                chunk_ids,
+            )
             if transfer_spec is not None:
                 remote_prepare_start = time.perf_counter()
                 for backend_name, backend in self.storage_manager.storage_backends.items():
@@ -1167,6 +1249,10 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        lookup_chunk_lengths = extract_chunk_lengths(
+            request_configs,
+            LOOKUP_CHUNK_LENGTHS_CONFIG,
+        )
 
         location = None
         contains_time = 0.0
@@ -1174,6 +1260,8 @@ class LMCacheEngine:
             tokens=tokens,
             mask=mask,
             request_configs=request_configs,
+            chunk_lengths=lookup_chunk_lengths,
+            chunk_lengths_config_name=LOOKUP_CHUNK_LENGTHS_CONFIG,
         ):
             assert isinstance(key, CacheEngineKey)
 
@@ -1424,7 +1512,10 @@ class LMCacheEngine:
         res = 0
         try:
             lookup_chunk_lengths = (
-                extract_lookup_chunk_lengths(request_configs)
+                extract_chunk_lengths(
+                    request_configs,
+                    LOOKUP_CHUNK_LENGTHS_CONFIG,
+                )
                 if tokens is not None
                 else None
             )
@@ -1433,7 +1524,8 @@ class LMCacheEngine:
                 hashes=hashes,
                 offsets=offsets,
                 request_configs=request_configs,
-                lookup_chunk_lengths=lookup_chunk_lengths,
+                chunk_lengths=lookup_chunk_lengths,
+                chunk_lengths_config_name=LOOKUP_CHUNK_LENGTHS_CONFIG,
             )
 
             # TODO: support batched_contains when layerwise is enabled
@@ -1590,6 +1682,10 @@ class LMCacheEngine:
 
         if search_range is None:
             search_range = self.retrieve_locations
+        lookup_chunk_lengths = extract_chunk_lengths(
+            request_configs,
+            LOOKUP_CHUNK_LENGTHS_CONFIG,
+        )
 
         # TODO(Jiayi): make token database able to return list.
         for start, end, key in self.token_database.process_tokens(
@@ -1597,6 +1693,8 @@ class LMCacheEngine:
             hashes=hashes,
             offsets=offsets,
             request_configs=request_configs,
+            chunk_lengths=lookup_chunk_lengths,
+            chunk_lengths_config_name=LOOKUP_CHUNK_LENGTHS_CONFIG,
         ):
             assert isinstance(key, CacheEngineKey)
             keys.append(key)
@@ -1880,6 +1978,10 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        lookup_chunk_lengths = extract_chunk_lengths(
+            request_configs,
+            LOOKUP_CHUNK_LENGTHS_CONFIG,
+        )
 
         tot_kv_size = 0
         chunks: List[ProcessedChunk] = []
@@ -1906,6 +2008,8 @@ class LMCacheEngine:
             tokens=tokens,
             mask=mask,
             request_configs=request_configs,
+            chunk_lengths=lookup_chunk_lengths,
+            chunk_lengths_config_name=LOOKUP_CHUNK_LENGTHS_CONFIG,
         ):
             assert isinstance(key, CacheEngineKey)
             memory_obj = memory_obj_map.get(key)
@@ -1949,12 +2053,18 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        lookup_chunk_lengths = extract_chunk_lengths(
+            request_configs,
+            LOOKUP_CHUNK_LENGTHS_CONFIG,
+        )
 
         chunk_infos = []
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
             request_configs=request_configs,
+            chunk_lengths=lookup_chunk_lengths,
+            chunk_lengths_config_name=LOOKUP_CHUNK_LENGTHS_CONFIG,
         ):
             assert isinstance(key, CacheEngineKey)
             chunk_infos.append((key, start, end))
