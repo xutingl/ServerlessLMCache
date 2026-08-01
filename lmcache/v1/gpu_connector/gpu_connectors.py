@@ -1421,6 +1421,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
+        skip_d2h = os.getenv("PD_BACKEND_SKIP_D2H", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
 
         self._lazy_initialize_buffer(self.kvcaches)
 
@@ -1443,7 +1449,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         tmp_gpu_buffer_objs: list[MemoryObj] = []
         tmp_gpu_buffer_tensors: list[torch.Tensor] = []
-        if self.use_gpu:
+        if self.use_gpu and not skip_d2h:
             assert self.gpu_buffer_allocator is not None
             for _ in range(self.layerwise_store_stream_count):
                 tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
@@ -1460,7 +1466,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         destination_is_pinned: Optional[bool] = None
         destination_is_contiguous: Optional[bool] = None
         source_is_contiguous: Optional[bool] = None
-        use_cpu_staging = self.use_cpu_staging and self.use_gpu and sync
+        use_cpu_staging = (
+            self.use_cpu_staging and self.use_gpu and sync and not skip_d2h
+        )
         cpu_staging_tensor: Optional[torch.Tensor] = None
         cpu_staging_allocation_time = 0.0
         cpu_view_creation_time = 0.0
@@ -1498,7 +1506,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             self.chunk_copy_stream_count, num_chunks_per_layer
         )
         active_copy_stream_count = (
-            effective_copy_stream_count if self.use_gpu and not use_cpu_staging else 0
+            effective_copy_stream_count
+            if self.use_gpu and not use_cpu_staging and not skip_d2h
+            else 0
         )
         offload_handles: list[LayerwiseOffloadHandle] = []
         timing_lock = threading.Lock()
@@ -1592,7 +1602,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             )
             selected_copy_streams = select_layer_copy_streams(store_stream_id)
             tmp_gpu_buffer_tensor = (
-                tmp_gpu_buffer_tensors[store_stream_id] if self.use_gpu else None
+                tmp_gpu_buffer_tensors[store_stream_id]
+                if self.use_gpu and not skip_d2h
+                else None
             )
             layer_start_event = (
                 torch.cuda.Event(enable_timing=True) if gpu_timing else None
@@ -1649,7 +1661,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 layer_wait_stream_call_time += wait_stream_elapsed
                 if gather_start_event is not None:
                     gather_start_event.record(selected_store_stream)
-                if self.use_gpu:
+                if self.use_gpu and not skip_d2h:
                     assert tmp_gpu_buffer_tensor is not None
                     gather_call_start = time.perf_counter()
                     lmc_ops.single_layer_kv_transfer(
@@ -1668,7 +1680,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 if copy_ready_event is not None:
                     copy_ready_event.record(selected_store_stream)
                 chunk_copy_loop_start = time.perf_counter()
-                if use_cpu_staging:
+                if skip_d2h:
+                    pass
+                elif use_cpu_staging:
                     assert tmp_gpu_buffer_tensor is not None
                     assert cpu_staging_tensor is not None
                     staging_submit_start = time.perf_counter()
@@ -1904,6 +1918,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             "[req_id=%s] Layerwise offload breakdown: "
             "layers=%d, chunks_per_layer=%d, store_streams=%d, "
             "copy_streams=%d, cpu_staging=%s, "
+            "skip_d2h=%s, "
             "setup_time=%.4f ms, "
             "wait_stream_call_time=%.4f ms, gather_call_time=%.4f ms, "
             "chunk_copy_loop_time=%.4f ms, sync_wait_time=%.4f ms, "
@@ -1915,6 +1930,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             self.layerwise_store_stream_count,
             active_copy_stream_count,
             use_cpu_staging,
+            skip_d2h,
             setup_time * 1000,
             wait_stream_call_time * 1000,
             gather_call_time * 1000,

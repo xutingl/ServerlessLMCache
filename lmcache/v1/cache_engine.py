@@ -467,9 +467,39 @@ class LMCacheEngine:
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
+        block_lease = kwargs.pop("block_lease", None)
+        block_lease_released = False
+        req_id = self._get_req_id(kwargs)
+
+        def close_store_block_lease(phase: str) -> None:
+            nonlocal block_lease_released
+            if block_lease is None or block_lease_released:
+                return
+            close = getattr(block_lease, "close", None)
+            if not callable(close):
+                logger.warning(
+                    "[pd-demo-block-pin] op=release_skip req_id=%s phase=%s "
+                    "reason=invalid_store_lease",
+                    req_id,
+                    phase,
+                )
+                block_lease_released = True
+                return
+            release_start = time.perf_counter()
+            close()
+            release_ms = (time.perf_counter() - release_start) * 1000
+            block_lease_released = True
+            logger.info(
+                "[pd-demo-block-pin] op=release req_id=%s phase=%s release_ms=%.4f",
+                req_id,
+                phase,
+                release_ms,
+            )
+
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store operation")
+            close_store_block_lease("unhealthy")
             return
 
         assert self.gpu_connector is not None, (
@@ -478,12 +508,10 @@ class LMCacheEngine:
 
         if self._is_passive():
             logger.debug(f"rank={self.metadata.worker_id} ignore store")
+            close_store_block_lease("passive")
             return
 
         assert self.storage_manager is not None
-
-        # Get req_id for logging
-        req_id = self._get_req_id(kwargs)
 
         # Initialize num_to_store_tokens to avoid reference before assignment
         num_to_store_tokens = 0
@@ -519,6 +547,7 @@ class LMCacheEngine:
                 "Freeze mode enabled, skipping store operation for %d tokens",
                 num_to_store_tokens,
             )
+            close_store_block_lease("frozen")
             return
 
         store_stats = self.stats_monitor.on_store_request(num_to_store_tokens)
@@ -613,10 +642,14 @@ class LMCacheEngine:
 
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
+            close_store_block_lease("no_memory_objs")
             return
 
         with store_stats.profile_from_gpu():
-            self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+            try:
+                self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+            finally:
+                close_store_block_lease("d2h_done")
 
         with store_stats.profile_put():
             chunk_ids = _chunk_ids_for_spans(
@@ -686,8 +719,103 @@ class LMCacheEngine:
             storage backends. In the last iteration, it puts the memory objects
             of the last layer to the storage backends.
         """
+        layerwise_block_leases = kwargs.pop("layerwise_block_leases", None)
+        req_id = self._get_req_id(kwargs)
+
+        def lease_ref_summary(lease: Any, limit: int = 8) -> tuple[int, str]:
+            refs = getattr(lease, "refs", ())
+            block_ids = [getattr(ref, "block_id", ref) for ref in refs]
+            if len(block_ids) <= limit:
+                return len(block_ids), str(block_ids)
+            head = ", ".join(str(block_id) for block_id in block_ids[:limit])
+            return len(block_ids), f"[{head}, ... total={len(block_ids)}]"
+
+        def pop_block_lease(layer_id: int) -> Any:
+            if layerwise_block_leases is None:
+                return None
+            popleft = getattr(layerwise_block_leases, "popleft", None)
+            if not callable(popleft):
+                logger.warning(
+                    "[pd-demo-block-pin] op=bind_skip req_id=%s layer=%d "
+                    "reason=invalid_lease_queue",
+                    req_id,
+                    layer_id,
+                )
+                return None
+            try:
+                lease = popleft()
+            except IndexError:
+                logger.warning(
+                    "[pd-demo-block-pin] op=bind_skip req_id=%s layer=%d "
+                    "reason=empty_lease_queue",
+                    req_id,
+                    layer_id,
+                )
+                return None
+            block_count, block_ids = lease_ref_summary(lease)
+            logger.info(
+                "[pd-demo-block-pin] op=bind req_id=%s layer=%d blocks=%d "
+                "block_ids=%s remaining_leases=%s",
+                req_id,
+                layer_id,
+                block_count,
+                block_ids,
+                len(layerwise_block_leases),
+            )
+            return lease
+
+        def close_block_lease(lease: Any, layer_id: int, phase: str) -> float:
+            if lease is None:
+                return 0.0
+            close = getattr(lease, "close", None)
+            if not callable(close):
+                logger.warning(
+                    "[pd-demo-block-pin] op=release_skip req_id=%s layer=%d "
+                    "phase=%s reason=invalid_lease",
+                    req_id,
+                    layer_id,
+                    phase,
+                )
+                return 0.0
+            release_start = time.perf_counter()
+            close()
+            release_elapsed = time.perf_counter() - release_start
+            block_count, block_ids = lease_ref_summary(lease)
+            logger.info(
+                "[pd-demo-block-pin] op=release req_id=%s layer=%d phase=%s "
+                "blocks=%d block_ids=%s release_ms=%.4f",
+                req_id,
+                layer_id,
+                phase,
+                block_count,
+                block_ids,
+                release_elapsed * 1000,
+            )
+            return release_elapsed
+
+        def release_remaining_block_leases(reason: str) -> None:
+            if layerwise_block_leases is None:
+                return
+            released = 0
+            while True:
+                try:
+                    lease = layerwise_block_leases.popleft()
+                except IndexError:
+                    break
+                close_block_lease(lease, -1, reason)
+                released += 1
+            if released:
+                logger.info(
+                    "[pd-demo-block-pin] op=release_remaining req_id=%s "
+                    "reason=%s leases=%d",
+                    req_id,
+                    reason,
+                    released,
+                )
+
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
+            release_remaining_block_leases("unhealthy")
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
             return
 
@@ -696,8 +824,6 @@ class LMCacheEngine:
             "gpu_connector is required for store_layer operation"
         )
 
-        # Get req_id for logging
-        req_id = self._get_req_id(kwargs)
         if mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
         else:
@@ -719,6 +845,7 @@ class LMCacheEngine:
                 "Freeze mode enabled, skipping store_layer for %d tokens",
                 num_to_store_tokens,
             )
+            release_remaining_block_leases("frozen")
             # Still need to yield to avoid StopIteration
             for layer_id in range(self.num_layers):
                 yield
@@ -918,6 +1045,7 @@ class LMCacheEngine:
             put_ready_wait_time = 0.0
             put_future_wait_time = 0.0
             put_task_wall_time = 0.0
+            block_lease_release_time = 0.0
             yield_resume_time = 0.0
             layer_connector_next_time = 0.0
             layer_step_time = 0.0
@@ -942,11 +1070,13 @@ class LMCacheEngine:
             def submit_layer_put(
                 layer_id: int,
                 offload_handle: LayerwiseOffloadHandle,
+                block_lease: Any,
             ) -> None:
                 nonlocal io_time
                 nonlocal put_submit_time
                 nonlocal put_ready_wait_time
                 nonlocal put_task_wall_time
+                nonlocal block_lease_release_time
                 executor = self._layerwise_put_executor
                 assert executor is not None
 
@@ -955,15 +1085,24 @@ class LMCacheEngine:
                     nonlocal put_submit_time
                     nonlocal put_ready_wait_time
                     nonlocal put_task_wall_time
+                    nonlocal block_lease_release_time
                     task_start = time.perf_counter()
                     wait_start = time.perf_counter()
+                    lease_release_elapsed = 0.0
                     try:
-                        offload_handle.wait()
-                    except Exception:
-                        for memory_obj in memory_objs[layer_id]:
-                            memory_obj.ref_count_down()
-                        raise
-                    wait_end = time.perf_counter()
+                        try:
+                            offload_handle.wait()
+                        except Exception:
+                            for memory_obj in memory_objs[layer_id]:
+                                memory_obj.ref_count_down()
+                            raise
+                    finally:
+                        wait_end = time.perf_counter()
+                        lease_release_elapsed = close_block_lease(
+                            block_lease,
+                            layer_id,
+                            "d2h_done",
+                        )
                     ready_wait_elapsed = wait_end - wait_start
 
                     put_start = time.perf_counter()
@@ -981,14 +1120,16 @@ class LMCacheEngine:
                         put_submit_time += put_elapsed
                         io_time += task_wall_elapsed
                         put_task_wall_time += task_wall_elapsed
+                        block_lease_release_time += lease_release_elapsed
                     if detailed_offload_timing:
                         logger.info(
                             "[req_id=%s] Layerwise async put step: "
                             "layer=%d ready_wait_ms=%.4f "
-                            "put_submit_ms=%.4f task_ms=%.4f",
+                            "lease_release_ms=%.4f put_submit_ms=%.4f task_ms=%.4f",
                             req_id,
                             layer_id,
                             ready_wait_elapsed * 1000,
+                            lease_release_elapsed * 1000,
                             put_elapsed * 1000,
                             task_wall_elapsed * 1000,
                         )
@@ -1030,7 +1171,7 @@ class LMCacheEngine:
                         "Layerwise offload handle order mismatch: "
                         f"expected layer 0, got {first_offload_handle.layer_id}"
                     )
-                submit_layer_put(0, first_offload_handle)
+                submit_layer_put(0, first_offload_handle, pop_block_lease(0))
 
                 for layer_id in range(1, self.num_layers):
                     yield_start = time.perf_counter()
@@ -1054,7 +1195,11 @@ class LMCacheEngine:
                             f"expected layer {layer_id}, "
                             f"got {getattr(offload_handle, 'layer_id', None)}"
                         )
-                    submit_layer_put(layer_id, offload_handle)
+                    submit_layer_put(
+                        layer_id,
+                        offload_handle,
+                        pop_block_lease(layer_id),
+                    )
                     layer_end = time.perf_counter()
                     layer_step_time += layer_end - yield_end
                     if detailed_offload_timing:
@@ -1117,8 +1262,16 @@ class LMCacheEngine:
                     yield_elapsed = yield_end - yield_start
                     yield_resume_time += yield_elapsed
                     t_io = time.perf_counter()
+                    block_lease = pop_block_lease(layer_id)
                     offload_start = time.perf_counter()
-                    next(mem_obj_generator)
+                    try:
+                        next(mem_obj_generator)
+                    finally:
+                        block_lease_release_time += close_block_lease(
+                            block_lease,
+                            layer_id,
+                            "sync_next_done",
+                        )
                     offload_end = time.perf_counter()
                     offload_elapsed = offload_end - offload_start
                     gpu_offload_step_time += offload_elapsed
@@ -1179,6 +1332,7 @@ class LMCacheEngine:
                     f"put_submit_ms={put_submit_time * 1000:.4f} "
                     f"put_future_wait_ms={put_future_wait_time * 1000:.4f} "
                     f"put_task_wall_ms={put_task_wall_time * 1000:.4f} "
+                    f"block_lease_release_ms={block_lease_release_time * 1000:.4f} "
                     f"active_layer_ms={layer_step_time * 1000:.4f} "
                     f"other_ms={pipeline_other_time * 1000:.4f}"
                 ),
@@ -1210,7 +1364,8 @@ class LMCacheEngine:
                 "remote_prepare_layers=%d, remote_prepare_submit_time=%.4f ms, "
                 "yield_resume_time=%.4f ms, put_ready_wait_time=%.4f ms, "
                 "put_submit_time=%.4f ms, put_future_wait_time=%.4f ms, "
-                "put_task_wall_time=%.4f ms, pipeline_other_time=%.4f ms, "
+                "put_task_wall_time=%.4f ms, block_lease_release_time=%.4f ms, "
+                "pipeline_other_time=%.4f ms, "
                 "total_time=%.4f ms",
                 req_id,
                 len(starts),
@@ -1225,15 +1380,18 @@ class LMCacheEngine:
                 put_submit_time * 1000,
                 put_future_wait_time * 1000,
                 put_task_wall_time * 1000,
+                block_lease_release_time * 1000,
                 pipeline_other_time * 1000,
                 (wall_end - prepare_start) * 1000,
             )
         else:
+            release_remaining_block_leases("no_keys")
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
             for layer_id in range(self.num_layers):
                 yield
 
+        release_remaining_block_leases("store_layer_end")
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
         yield
 
