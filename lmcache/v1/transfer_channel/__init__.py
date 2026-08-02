@@ -21,7 +21,7 @@ def CreateTransferChannel(
 ) -> BaseTransferChannel:
     """
     Create a transfer channel based on the specified channel type.
-    Supports "nixl" and "mock_memory" channel types.
+    Supports "nixl", "tcp_socket", and "mock_memory" channel types.
     If nixl is not available, automatically falls back to mock_memory
     which is a mock implementation for testing purposes.
 
@@ -38,7 +38,7 @@ def CreateTransferChannel(
     :return: An instance of the specified transfer channel.
     """
 
-    assert channel_type in ["nixl", "mock_memory"], (
+    assert channel_type in ["nixl", "tcp_socket", "mock_memory"], (
         f"Unsupported channel type: {channel_type}"
     )
 
@@ -50,6 +50,23 @@ def CreateTransferChannel(
             "`backends` must be provided to create nixl transfer channel."
         )
         transfer_channel = NixlChannel(
+            async_mode=async_mode,
+            role=role,
+            buffer_ptr=buffer_ptr,
+            buffer_size=buffer_size,
+            align_bytes=align_bytes,
+            tp_rank=tp_rank,
+            peer_init_url=peer_init_url,
+            device=device,
+            **kwargs,
+        )
+        return transfer_channel
+
+    if channel_type == "tcp_socket":
+        # First Party
+        from lmcache.v1.transfer_channel.tcp_socket_channel import TcpSocketChannel
+
+        transfer_channel = TcpSocketChannel(
             async_mode=async_mode,
             role=role,
             buffer_ptr=buffer_ptr,
