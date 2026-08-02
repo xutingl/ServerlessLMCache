@@ -3,8 +3,11 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Union
 import asyncio
+import json
+import os
 import threading
 import time
+import traceback
 import uuid
 
 # Third Party
@@ -13,6 +16,7 @@ import zmq
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.request_metrics_bridge import log_lmcache_count_metric
 from lmcache.v1.memory_management import (
     MemoryObj,
 )
@@ -31,6 +35,22 @@ from lmcache.v1.transfer_channel.transfer_utils import (
 )
 
 logger = init_logger(__name__)
+NIXL_INIT_LOOP_METRIC_RID = "global#NixlInitLoop"
+NIXL_INIT_LOOP_ERROR_METRIC = "NixlInitLoopError"
+NIXL_INIT_LOOP_FIRST_ERROR_METRIC = "NixlInitLoopFirstError"
+NIXL_INIT_LOOP_LOG_INTERVAL_SECONDS = 5.0
+
+
+def _debug_tag(value: Any) -> str:
+    tag = "".join(
+        ch if ch.isalnum() or ch in {"_", "-", "."} else "_"
+        for ch in str(value or "unknown")
+    ).strip("_")
+    return tag or "unknown"
+
+
+def _safe_filename_tag(value: Any) -> str:
+    return _debug_tag(value).replace(".", "_")
 
 
 class NixlMsgBase(msgspec.Struct, tag=True):
@@ -112,6 +132,14 @@ class NixlChannel(BaseTransferChannel):
             self.zmq_context = get_zmq_context(use_asyncio=False)
         self.peer_init_url = kwargs["peer_init_url"]
         self.event_loop = kwargs.get("event_loop", None)
+        self._init_loop_error_lock = threading.Lock()
+        self._init_loop_first_error_recorded = False
+        self._init_loop_error_count = 0
+        self._init_loop_last_log_time = 0.0
+        self._init_loop_debug_path = (
+            "/tmp/lmcache_nixl_init_first_error_"
+            f"{os.getpid()}_{_safe_filename_tag(self.peer_init_url)}.json"
+        )
 
         self._init_side_channels()
 
@@ -296,6 +324,90 @@ class NixlChannel(BaseTransferChannel):
 
         return resp
 
+    def _record_init_loop_exception(
+        self,
+        exc: Exception,
+        *,
+        stage: str,
+        req_type: str,
+        async_mode: bool,
+    ) -> None:
+        error_type = type(exc).__name__
+        errno = getattr(exc, "errno", None)
+        errno_tag = f"errno_{errno}" if errno is not None else "no_errno"
+        now = time.monotonic()
+        with self._init_loop_error_lock:
+            self._init_loop_error_count += 1
+            error_count = self._init_loop_error_count
+            first_error = not self._init_loop_first_error_recorded
+            if first_error:
+                self._init_loop_first_error_recorded = True
+            should_log = (
+                first_error
+                or now - self._init_loop_last_log_time
+                >= NIXL_INIT_LOOP_LOG_INTERVAL_SECONDS
+            )
+            if should_log:
+                self._init_loop_last_log_time = now
+
+        metric_tags = [
+            _debug_tag(stage),
+            _debug_tag(req_type),
+            _debug_tag(error_type),
+            _debug_tag(errno_tag),
+            "async" if async_mode else "sync",
+        ]
+        if should_log:
+            metric_name = "#".join([NIXL_INIT_LOOP_ERROR_METRIC, *metric_tags])
+            log_lmcache_count_metric(NIXL_INIT_LOOP_METRIC_RID, metric_name, 1)
+
+        if first_error:
+            first_metric_name = "#".join(
+                [NIXL_INIT_LOOP_FIRST_ERROR_METRIC, *metric_tags]
+            )
+            log_lmcache_count_metric(
+                NIXL_INIT_LOOP_METRIC_RID,
+                first_metric_name,
+                1,
+            )
+            payload = {
+                "pid": os.getpid(),
+                "peer_init_url": self.peer_init_url,
+                "role": self.role,
+                "async_mode": async_mode,
+                "stage": stage,
+                "req_type": req_type,
+                "error_type": error_type,
+                "errno": errno,
+                "message": str(exc),
+                "traceback": "".join(
+                    traceback.format_exception(type(exc), exc, exc.__traceback__)
+                ),
+            }
+            try:
+                with open(self._init_loop_debug_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, sort_keys=True)
+            except Exception:
+                logger.debug(
+                    "Failed to write NIXL init loop debug file",
+                    exc_info=True,
+                )
+
+        if should_log:
+            logger.error(
+                "Failed to process initialization loop: %s "
+                "stage=%s req_type=%s error_type=%s errno=%s count=%d "
+                "first_error_path=%s",
+                str(exc),
+                stage,
+                req_type,
+                error_type,
+                errno,
+                error_count,
+                self._init_loop_debug_path,
+                exc_info=first_error,
+            )
+
     def _init_loop(self):
         # Initialize initialization side channels
         self.init_side_channel = get_zmq_socket(
@@ -315,19 +427,30 @@ class NixlChannel(BaseTransferChannel):
         # (3) Exchanging side messages if any. This depends on the backend
         # that uses the channel.
         while self.running:
+            stage = "recv"
+            req_type = "unknown"
             try:
                 req_bytes = self.init_side_channel.recv()
 
                 logger.info("Received initialization request")
 
+                stage = "decode"
                 req = msgspec.msgpack.decode(req_bytes, type=Union[NixlMsg, SideMsg])
+                req_type = type(req).__name__
 
+                stage = f"handle_{req_type}"
                 resp = self._handle_init_msg(req)
 
+                stage = f"send_{type(resp).__name__}"
                 self.init_side_channel.send(msgspec.msgpack.encode(resp))
 
             except Exception as e:
-                logger.error("Failed to process initialization loop: %s", str(e))
+                self._record_init_loop_exception(
+                    e,
+                    stage=stage,
+                    req_type=req_type,
+                    async_mode=False,
+                )
                 if self.running:
                     time.sleep(0.01)
 
@@ -344,21 +467,32 @@ class NixlChannel(BaseTransferChannel):
         logger.info("Starting async initialization loop")
 
         while self.running:
+            stage = "recv"
+            req_type = "unknown"
             try:
                 req_bytes = await self.init_side_channel.recv()
 
                 logger.info("Received initialization request")
 
+                stage = "decode"
                 req = msgspec.msgpack.decode(req_bytes, type=Union[NixlMsg, SideMsg])
+                req_type = type(req).__name__
 
+                stage = f"handle_{req_type}"
                 resp = self._handle_init_msg(req)
 
+                stage = f"send_{type(resp).__name__}"
                 await self.init_side_channel.send(msgspec.msgpack.encode(resp))
 
             except Exception as e:
-                logger.error("Failed to process initialization loop: %s", str(e))
+                self._record_init_loop_exception(
+                    e,
+                    stage=stage,
+                    req_type=req_type,
+                    async_mode=True,
+                )
                 if self.running:
-                    time.sleep(0.01)
+                    await asyncio.sleep(0.01)
 
     ############################################################
     # Utility functions
