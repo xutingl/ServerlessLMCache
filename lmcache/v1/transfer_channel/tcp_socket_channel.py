@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import ctypes
+from dataclasses import dataclass
+import os
 import threading
+import time
 from typing import Optional, Union
 
 # Third Party
@@ -11,6 +15,7 @@ import zmq
 
 # First Party
 from lmcache.v1.memory_management import MemoryObj
+from lmcache.logging import init_logger
 from lmcache.v1.rpc_utils import get_zmq_socket
 from lmcache.v1.transfer_channel.py_socket_channel import (
     PySocketChannel,
@@ -22,16 +27,23 @@ from lmcache.v1.transfer_channel.transfer_utils import (
     InitSideRetMsgBase,
 )
 
+logger = init_logger(__name__)
 
-class TcpSocketWriteRequest(msgspec.Struct, tag=True):
-    req_id: str
-    remote_indexes: list[int]
-    payloads: list[bytes]
+_DEFAULT_DATA_CHUNK_BYTES = 512 * 1024
+_DATA_SOCKET_HWM = 2048
 
 
 class TcpSocketWriteHeader(msgspec.Struct, tag=True):
     req_id: str
     remote_indexes: list[int]
+    payload_sizes: list[int]
+
+
+class TcpSocketChunkHeader(msgspec.Struct, tag=True):
+    req_id: str
+    object_index: int
+    offset: int
+    size: int
 
 
 class TcpSocketWriteResponse(msgspec.Struct, tag=True):
@@ -40,13 +52,49 @@ class TcpSocketWriteResponse(msgspec.Struct, tag=True):
     error: str = ""
 
 
+TcpSocketDataMessage = Union[TcpSocketWriteHeader, TcpSocketChunkHeader]
+
+
+@dataclass
+class _PendingTcpSocketWrite:
+    identity: bytes
+    header: TcpSocketWriteHeader
+    start_time: float
+    decode_ms: float
+    expected_bytes: int
+    received_bytes: int = 0
+    payload_frames: int = 0
+    write_ms: float = 0.0
+
+
 class TcpSocketChannel(PySocketChannel):
-    """Simple ZMQ/TCP data-plane channel for PD transfer."""
+    """ZMQ/TCP data-plane channel that writes directly into its paged buffer."""
 
     def __init__(self, async_mode: bool = False, **kwargs):
         super().__init__(async_mode=async_mode, **kwargs)
         self._data_sockets: dict[tuple[int, str], zmq.Socket] = {}
         self._data_sockets_lock = threading.Lock()
+        self._data_receiver_socket: Optional[zmq.Socket] = None
+        self._data_receiver_thread: Optional[threading.Thread] = None
+        self._data_receiver_buffer_owner = None
+        self._data_receiver_buffer: Optional[memoryview] = None
+        self._data_chunk_bytes = _tcp_socket_data_chunk_bytes()
+        self._pending_writes: dict[
+            tuple[bytes, str],
+            _PendingTcpSocketWrite,
+        ] = {}
+
+        data_listen_url = kwargs.get("data_listen_url")
+        if data_listen_url is not None:
+            if self.role not in {"receiver", "both"}:
+                raise ValueError(
+                    "data_listen_url is only valid for a TCP receiver or both role"
+                )
+            if kwargs.get("device") != "cpu":
+                raise ValueError(
+                    "TcpSocketChannel direct receive requires a CPU paged buffer"
+                )
+            self._start_data_receiver(data_listen_url)
 
     def lazy_init_peer_connection(
         self,
@@ -120,8 +168,9 @@ class TcpSocketChannel(PySocketChannel):
             header = TcpSocketWriteHeader(
                 req_id=str(transfer_spec.get("req_id") or ""),
                 remote_indexes=remote_indexes,
+                payload_sizes=[payload.nbytes for payload in payloads],
             )
-            _send_write_multipart(socket, header, payloads)
+            _send_write_stream(socket, header, payloads, self._data_chunk_bytes)
             resp_bytes = socket.recv()
             resp = msgspec.msgpack.decode(resp_bytes, type=TcpSocketWriteResponse)
         except Exception:
@@ -182,6 +231,13 @@ class TcpSocketChannel(PySocketChannel):
         raise NotImplementedError
 
     def close(self):
+        self.running = False
+        if self._data_receiver_thread is not None:
+            self._data_receiver_thread.join()
+            self._data_receiver_thread = None
+        if self._data_receiver_socket is not None:
+            self._data_receiver_socket.close(linger=0)
+            self._data_receiver_socket = None
         with self._data_sockets_lock:
             sockets = list(self._data_sockets.values())
             self._data_sockets.clear()
@@ -198,12 +254,12 @@ class TcpSocketChannel(PySocketChannel):
                     self.zmq_context,
                     receiver_data_url,
                     "tcp",
-                    zmq.REQ,
+                    zmq.DEALER,
                     "connect",
                 )
                 socket.setsockopt(zmq.LINGER, 0)
-                socket.setsockopt(zmq.SNDHWM, 1)
-                socket.setsockopt(zmq.RCVHWM, 1)
+                socket.setsockopt(zmq.SNDHWM, _DATA_SOCKET_HWM)
+                socket.setsockopt(zmq.RCVHWM, _DATA_SOCKET_HWM)
                 self._data_sockets[key] = socket
             return socket
 
@@ -218,21 +274,294 @@ class TcpSocketChannel(PySocketChannel):
                 self._data_sockets.pop(key, None)
         socket.close(linger=0)
 
+    def _start_data_receiver(self, data_listen_url: str) -> None:
+        if self.buffer_ptr is None or self.buffer_size <= 0:
+            raise ValueError("TcpSocketChannel receiver requires a valid paged buffer")
 
-def _send_write_multipart(
+        buffer_type = ctypes.c_ubyte * self.buffer_size
+        self._data_receiver_buffer_owner = buffer_type.from_address(self.buffer_ptr)
+        self._data_receiver_buffer = memoryview(
+            self._data_receiver_buffer_owner
+        ).cast("B")
+
+        socket = get_zmq_socket(
+            self.zmq_context,
+            data_listen_url,
+            "tcp",
+            zmq.ROUTER,
+            "bind",
+        )
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.SNDHWM, _DATA_SOCKET_HWM)
+        socket.setsockopt(zmq.RCVHWM, _DATA_SOCKET_HWM)
+        socket.setsockopt(zmq.RCVTIMEO, 100)
+        self._data_receiver_socket = socket
+        self._data_receiver_thread = threading.Thread(
+            target=self._data_receiver_loop,
+            daemon=True,
+            name="lmcache-tcp-data-recv",
+        )
+        self._data_receiver_thread.start()
+
+    def _data_receiver_loop(self) -> None:
+        assert self._data_receiver_socket is not None
+        while self.running:
+            try:
+                identity, control_frame = self._recv_router_control_frame()
+            except zmq.Again:
+                continue
+            except zmq.ZMQError:
+                if self.running:
+                    logger.exception("TCP data receiver stopped unexpectedly")
+                return
+            except Exception:
+                if self.running:
+                    logger.exception("Failed to read TCP data control frame")
+                continue
+
+            loop_start = time.perf_counter()
+            req_id = ""
+            try:
+                stage_start = time.perf_counter()
+                message = msgspec.msgpack.decode(
+                    bytes(control_frame), type=TcpSocketDataMessage
+                )
+                decode_ms = _elapsed_ms(stage_start)
+
+                if isinstance(message, TcpSocketWriteHeader):
+                    req_id = message.req_id
+                    self._handle_write_header(identity, message, loop_start, decode_ms)
+                    continue
+
+                req_id = message.req_id
+                completed = self._handle_chunk_header(identity, message)
+                if completed is None:
+                    continue
+
+                write_resp = TcpSocketWriteResponse(
+                    req_id=req_id,
+                    written=len(completed.header.remote_indexes),
+                )
+                response_send_ms = self._send_write_response(
+                    identity,
+                    write_resp,
+                )
+                self._log_completed_write(
+                    completed,
+                    response_send_ms,
+                    error="",
+                )
+            except Exception as exc:
+                self._discard_remaining_frames()
+                completed = self._pending_writes.pop((identity, req_id), None)
+                write_resp = TcpSocketWriteResponse(
+                    req_id=req_id,
+                    written=0,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                try:
+                    response_send_ms = self._send_write_response(identity, write_resp)
+                except zmq.ZMQError:
+                    if self.running:
+                        logger.exception("Failed to acknowledge TCP data write")
+                    continue
+                if completed is None:
+                    logger.info(
+                        "[pd-demo-timing] receiver_data_loop "
+                        "req_id=%s chunks=0 zmq_frames=0 decode_ms=%.4f "
+                        "write_ms=0.0000 response_send_ms=%.4f total_ms=%.4f "
+                        "error=%s",
+                        req_id,
+                        _elapsed_ms(loop_start),
+                        response_send_ms,
+                        _elapsed_ms(loop_start),
+                        write_resp.error,
+                    )
+                else:
+                    self._log_completed_write(
+                        completed,
+                        response_send_ms,
+                        error=write_resp.error,
+                    )
+
+    def _recv_router_control_frame(self) -> tuple[bytes, zmq.Frame]:
+        assert self._data_receiver_socket is not None
+        identity_frame = self._data_receiver_socket.recv(copy=False)
+        if not self._data_receiver_socket.getsockopt(zmq.RCVMORE):
+            raise ValueError("missing TCP data control frame")
+        control_frame = self._data_receiver_socket.recv(copy=False)
+        return bytes(identity_frame), control_frame
+
+    def _handle_write_header(
+        self,
+        identity: bytes,
+        header: TcpSocketWriteHeader,
+        start_time: float,
+        decode_ms: float,
+    ) -> None:
+        if len(header.remote_indexes) != len(header.payload_sizes):
+            raise ValueError(
+                "remote_indexes length must match payload_sizes length: "
+                f"{len(header.remote_indexes)} != {len(header.payload_sizes)}"
+            )
+        for remote_index, payload_size in zip(
+            header.remote_indexes,
+            header.payload_sizes,
+            strict=True,
+        ):
+            offset = remote_index * self.align_bytes
+            if (
+                remote_index < 0
+                or payload_size <= 0
+                or payload_size > self.align_bytes
+                or offset + payload_size > self.buffer_size
+            ):
+                raise ValueError(
+                    "invalid paged-buffer write: "
+                    f"index={remote_index} size={payload_size} "
+                    f"page_size={self.align_bytes} buffer_size={self.buffer_size}"
+                )
+
+        key = (identity, header.req_id)
+        if key in self._pending_writes:
+            raise ValueError(f"duplicate TCP data write req_id={header.req_id!r}")
+        self._pending_writes[key] = _PendingTcpSocketWrite(
+            identity=identity,
+            header=header,
+            start_time=start_time,
+            decode_ms=decode_ms,
+            expected_bytes=sum(header.payload_sizes),
+        )
+
+    def _handle_chunk_header(
+        self,
+        identity: bytes,
+        chunk_header: TcpSocketChunkHeader,
+    ) -> Optional[_PendingTcpSocketWrite]:
+        key = (identity, chunk_header.req_id)
+        pending = self._pending_writes.get(key)
+        if pending is None:
+            # A header validation error may already have been reported while the
+            # sender had queued this request's payload chunks. Drop those orphan
+            # chunks silently so a later socket does not receive stale errors.
+            self._discard_remaining_frames()
+            return None
+        if self._data_receiver_buffer is None:
+            raise RuntimeError("TCP data receiver buffer was not initialized")
+        if not self._data_receiver_socket.getsockopt(zmq.RCVMORE):
+            raise ValueError("missing TCP data payload frame")
+
+        if (
+            chunk_header.object_index < 0
+            or chunk_header.object_index >= len(pending.header.remote_indexes)
+        ):
+            raise ValueError(
+                "invalid TCP data object index: "
+                f"{chunk_header.object_index} for {len(pending.header.remote_indexes)}"
+            )
+        payload_size = pending.header.payload_sizes[chunk_header.object_index]
+        if (
+            chunk_header.offset < 0
+            or chunk_header.size <= 0
+            or chunk_header.offset + chunk_header.size > payload_size
+        ):
+            raise ValueError(
+                "invalid TCP data chunk: "
+                f"object_index={chunk_header.object_index} "
+                f"offset={chunk_header.offset} size={chunk_header.size} "
+                f"payload_size={payload_size}"
+            )
+
+        remote_index = pending.header.remote_indexes[chunk_header.object_index]
+        buffer_offset = remote_index * self.align_bytes + chunk_header.offset
+        target = self._data_receiver_buffer[
+            buffer_offset : buffer_offset + chunk_header.size
+        ]
+        stage_start = time.perf_counter()
+        received = self._data_receiver_socket.recv_into(target)
+        pending.write_ms += _elapsed_ms(stage_start)
+        if received != chunk_header.size:
+            raise ValueError(
+                "payload size mismatch for TCP data chunk: "
+                f"{received} != {chunk_header.size}"
+            )
+        pending.received_bytes += received
+        pending.payload_frames += 1
+
+        if pending.received_bytes > pending.expected_bytes:
+            raise ValueError(
+                "received too many TCP data bytes: "
+                f"{pending.received_bytes} > {pending.expected_bytes}"
+            )
+        if pending.received_bytes == pending.expected_bytes:
+            return self._pending_writes.pop(key)
+        return None
+
+    def _send_write_response(
+        self,
+        identity: bytes,
+        response: TcpSocketWriteResponse,
+    ) -> float:
+        assert self._data_receiver_socket is not None
+        stage_start = time.perf_counter()
+        self._data_receiver_socket.send(identity, flags=zmq.SNDMORE)
+        self._data_receiver_socket.send(msgspec.msgpack.encode(response))
+        return _elapsed_ms(stage_start)
+
+    def _log_completed_write(
+        self,
+        completed: _PendingTcpSocketWrite,
+        response_send_ms: float,
+        error: str,
+    ) -> None:
+        written = len(completed.header.remote_indexes)
+        logger.info(
+            "[pd-demo-timing] receiver_tcp_socket_write "
+            "req_id=%s chunks=%d total_ms=%.4f",
+            completed.header.req_id,
+            written,
+            completed.write_ms,
+        )
+        logger.info(
+            "[pd-demo-timing] receiver_data_loop "
+            "req_id=%s chunks=%d zmq_frames=%d decode_ms=%.4f write_ms=%.4f "
+            "response_send_ms=%.4f total_ms=%.4f error=%s",
+            completed.header.req_id,
+            written,
+            completed.payload_frames,
+            completed.decode_ms,
+            completed.write_ms,
+            response_send_ms,
+            _elapsed_ms(completed.start_time),
+            error,
+        )
+
+    def _discard_remaining_frames(self) -> None:
+        assert self._data_receiver_socket is not None
+        while self._data_receiver_socket.getsockopt(zmq.RCVMORE):
+            self._data_receiver_socket.recv(copy=False)
+
+
+def _send_write_stream(
     socket: zmq.Socket,
     header: TcpSocketWriteHeader,
     payloads: list[memoryview],
+    chunk_bytes: int,
 ) -> None:
-    header_bytes = msgspec.msgpack.encode(header)
-    if not payloads:
-        socket.send(header_bytes)
-        return
-
-    socket.send(header_bytes, flags=zmq.SNDMORE)
-    for payload in payloads[:-1]:
-        socket.send(payload, flags=zmq.SNDMORE, copy=False)
-    socket.send(payloads[-1], copy=False)
+    socket.send(msgspec.msgpack.encode(header))
+    for object_index, payload in enumerate(payloads):
+        offset = 0
+        while offset < payload.nbytes:
+            size = min(chunk_bytes, payload.nbytes - offset)
+            chunk_header = TcpSocketChunkHeader(
+                req_id=header.req_id,
+                object_index=object_index,
+                offset=offset,
+                size=size,
+            )
+            socket.send(msgspec.msgpack.encode(chunk_header), flags=zmq.SNDMORE)
+            socket.send(payload[offset : offset + size], copy=False)
+            offset += size
 
 
 def _memory_obj_to_buffer(obj: Union[bytes, MemoryObj]) -> memoryview:
@@ -247,3 +576,17 @@ def _memory_obj_to_buffer(obj: Union[bytes, MemoryObj]) -> memoryview:
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
     return memoryview(tensor.view(torch.uint8).reshape(-1).numpy())
+
+
+def _elapsed_ms(start: float) -> float:
+    return (time.perf_counter() - start) * 1000
+
+
+def _tcp_socket_data_chunk_bytes() -> int:
+    raw_value = os.environ.get("LMCACHE_TCP_SOCKET_DATA_CHUNK_BYTES")
+    if raw_value is None:
+        return _DEFAULT_DATA_CHUNK_BYTES
+    value = int(raw_value)
+    if value <= 0:
+        raise ValueError("LMCACHE_TCP_SOCKET_DATA_CHUNK_BYTES must be positive")
+    return value
