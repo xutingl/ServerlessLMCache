@@ -35,12 +35,14 @@ _DATA_SOCKET_HWM = 2048
 
 class TcpSocketWriteHeader(msgspec.Struct, tag=True):
     req_id: str
+    write_id: int
     remote_indexes: list[int]
     payload_sizes: list[int]
 
 
 class TcpSocketChunkHeader(msgspec.Struct, tag=True):
     req_id: str
+    write_id: int
     object_index: int
     offset: int
     size: int
@@ -48,6 +50,7 @@ class TcpSocketChunkHeader(msgspec.Struct, tag=True):
 
 class TcpSocketWriteResponse(msgspec.Struct, tag=True):
     req_id: str
+    write_id: int
     written: int
     error: str = ""
 
@@ -79,8 +82,10 @@ class TcpSocketChannel(PySocketChannel):
         self._data_receiver_buffer_owner = None
         self._data_receiver_buffer: Optional[memoryview] = None
         self._data_chunk_bytes = _tcp_socket_data_chunk_bytes()
+        self._next_write_id = 0
+        self._next_write_id_lock = threading.Lock()
         self._pending_writes: dict[
-            tuple[bytes, str],
+            tuple[bytes, str, int],
             _PendingTcpSocketWrite,
         ] = {}
 
@@ -167,6 +172,7 @@ class TcpSocketChannel(PySocketChannel):
         try:
             header = TcpSocketWriteHeader(
                 req_id=str(transfer_spec.get("req_id") or ""),
+                write_id=self._allocate_write_id(),
                 remote_indexes=remote_indexes,
                 payload_sizes=[payload.nbytes for payload in payloads],
             )
@@ -179,6 +185,12 @@ class TcpSocketChannel(PySocketChannel):
 
         if resp.error:
             raise RuntimeError(f"TcpSocketChannel write failed: {resp.error}")
+        if resp.req_id != header.req_id or resp.write_id != header.write_id:
+            raise RuntimeError(
+                "TcpSocketChannel write response mismatch: "
+                f"expected=({header.req_id!r}, {header.write_id}) "
+                f"got=({resp.req_id!r}, {resp.write_id})"
+            )
         return int(resp.written)
 
     async def async_batched_write(
@@ -263,6 +275,12 @@ class TcpSocketChannel(PySocketChannel):
                 self._data_sockets[key] = socket
             return socket
 
+    def _allocate_write_id(self) -> int:
+        with self._next_write_id_lock:
+            write_id = self._next_write_id
+            self._next_write_id += 1
+            return write_id
+
     def _drop_data_socket(
         self,
         receiver_data_url: str,
@@ -321,6 +339,7 @@ class TcpSocketChannel(PySocketChannel):
 
             loop_start = time.perf_counter()
             req_id = ""
+            write_id = -1
             try:
                 stage_start = time.perf_counter()
                 message = msgspec.msgpack.decode(
@@ -330,16 +349,19 @@ class TcpSocketChannel(PySocketChannel):
 
                 if isinstance(message, TcpSocketWriteHeader):
                     req_id = message.req_id
+                    write_id = message.write_id
                     self._handle_write_header(identity, message, loop_start, decode_ms)
                     continue
 
                 req_id = message.req_id
+                write_id = message.write_id
                 completed = self._handle_chunk_header(identity, message)
                 if completed is None:
                     continue
 
                 write_resp = TcpSocketWriteResponse(
                     req_id=req_id,
+                    write_id=write_id,
                     written=len(completed.header.remote_indexes),
                 )
                 response_send_ms = self._send_write_response(
@@ -353,9 +375,13 @@ class TcpSocketChannel(PySocketChannel):
                 )
             except Exception as exc:
                 self._discard_remaining_frames()
-                completed = self._pending_writes.pop((identity, req_id), None)
+                completed = self._pending_writes.pop(
+                    (identity, req_id, write_id),
+                    None,
+                )
                 write_resp = TcpSocketWriteResponse(
                     req_id=req_id,
+                    write_id=write_id,
                     written=0,
                     error=f"{type(exc).__name__}: {exc}",
                 )
@@ -422,9 +448,12 @@ class TcpSocketChannel(PySocketChannel):
                     f"page_size={self.align_bytes} buffer_size={self.buffer_size}"
                 )
 
-        key = (identity, header.req_id)
+        key = (identity, header.req_id, header.write_id)
         if key in self._pending_writes:
-            raise ValueError(f"duplicate TCP data write req_id={header.req_id!r}")
+            raise ValueError(
+                "duplicate TCP data write "
+                f"req_id={header.req_id!r} write_id={header.write_id}"
+            )
         self._pending_writes[key] = _PendingTcpSocketWrite(
             identity=identity,
             header=header,
@@ -438,7 +467,7 @@ class TcpSocketChannel(PySocketChannel):
         identity: bytes,
         chunk_header: TcpSocketChunkHeader,
     ) -> Optional[_PendingTcpSocketWrite]:
-        key = (identity, chunk_header.req_id)
+        key = (identity, chunk_header.req_id, chunk_header.write_id)
         pending = self._pending_writes.get(key)
         if pending is None:
             # A header validation error may already have been reported while the
@@ -555,6 +584,7 @@ def _send_write_stream(
             size = min(chunk_bytes, payload.nbytes - offset)
             chunk_header = TcpSocketChunkHeader(
                 req_id=header.req_id,
+                write_id=header.write_id,
                 object_index=object_index,
                 offset=offset,
                 size=size,

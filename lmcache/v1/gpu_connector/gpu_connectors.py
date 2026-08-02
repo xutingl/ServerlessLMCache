@@ -1347,7 +1347,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         lmc_ops.single_layer_kv_transfer(
                             memory_obj.tensor,
                             self.kvcaches[layer_id],
-                            slot_mapping_full,
+                            slot_mapping[start:end],
                             lmc_ops.TransferDirection.H2D,
                             self.gpu_kv_format,
                             token_major=True,
