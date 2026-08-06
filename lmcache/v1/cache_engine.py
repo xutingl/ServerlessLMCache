@@ -258,7 +258,13 @@ class LMCacheEngine:
         # NOTE (Jiayi): This is currently used to support
         # dropping the kv cache from the buffer in PD backend
         # at decoder.
-        self.remove_after_retrieve = config.enable_pd and config.pd_role == "receiver"
+        # PD receiver-side objects are one-shot handoff buffers. In kv_both mode
+        # this worker can also receive PD objects, so they must be removed after
+        # retrieve just like the pure receiver role.
+        self.remove_after_retrieve = config.enable_pd and config.pd_role in (
+            "receiver",
+            "both",
+        )
 
         # asymmetric store/retrieve location can be specified
         # this is typically used (but not limited) in PD system
@@ -1690,6 +1696,7 @@ class LMCacheEngine:
             tot_kv_size = 0
 
             to_count_down = []
+            to_release = []
             for layer_id in range(self.num_layers):
                 layer_start = time.perf_counter()
                 t_io = time.perf_counter()
@@ -1728,6 +1735,9 @@ class LMCacheEngine:
                     layer_bytes += obj_size
                     tot_kv_size += obj_size
                 to_count_down.extend(mem_objs_layer)
+                to_release.extend(
+                    zip(keys_layer_major[layer_id], mem_objs_layer, strict=False)
+                )
                 if load_profile_enabled:
                     logger.info(
                         "[req_id=%s] Layerwise load layer=%d chunks=%d "
@@ -1745,7 +1755,9 @@ class LMCacheEngine:
                         (time.perf_counter() - layer_start) * 1000,
                     )
 
-            for mem_obj in to_count_down:
+            for key, mem_obj in to_release:
+                if self.remove_after_retrieve and not self._is_passive():
+                    self.storage_manager.remove(key, self.retrieve_locations)
                 mem_obj.ref_count_down()
         else:
             t_start = time.perf_counter()
