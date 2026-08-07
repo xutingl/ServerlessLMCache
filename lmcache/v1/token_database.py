@@ -388,17 +388,14 @@ class ChunkedTokenDatabase(TokenDatabase):
         config_name: str,
     ) -> Iterable[ProcessTokensResult]:
         total_len = len(tokens)
-        total_custom_len = sum(chunk_lengths)
-        if total_custom_len > total_len:
-            raise ValueError(
-                f"{config_name} sum exceeds token length: "
-                f"{total_custom_len} > {total_len}"
-            )
-
         prefix_hash = self._get_init_hash()
         start_idx = 0
         for chunk_len in chunk_lengths:
             end_idx = start_idx + chunk_len
+            # A request may provide chunk boundaries for tokens that have not
+            # arrived yet. Process only the complete prefix available now.
+            if end_idx > total_len:
+                break
             prefix_hash = self._hash_tokens(tokens[start_idx:end_idx], prefix_hash)
 
             if start_idx < num_falses < end_idx:

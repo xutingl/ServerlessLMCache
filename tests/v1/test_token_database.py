@@ -95,6 +95,29 @@ def test_chunked_token_database_custom_save_chunk_lengths():
     assert [hash_val for _, _, hash_val in results] == expected_hashes
 
 
+def test_chunked_token_database_custom_chunk_plan_can_run_ahead():
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=128, backend="cpu", save_unfull_chunk=False
+    )
+    db = ChunkedTokenDatabase(cfg, dumb_metadata())
+    tokens = generate_tokens(371, "cpu")
+
+    results = list(
+        db.process_tokens(
+            tokens=tokens,
+            make_key=False,
+            chunk_lengths=[128, 128, 115, 16],
+            chunk_lengths_config_name="lmcache.lookup_chunk_lengths",
+        )
+    )
+
+    assert [(start, end) for start, end, _ in results] == [
+        (0, 128),
+        (128, 256),
+        (256, 371),
+    ]
+
+
 def test_chunked_token_database_custom_save_chunk_lengths_with_mask():
     cfg = LMCacheEngineConfig.from_legacy(
         chunk_size=128, backend="cpu", save_unfull_chunk=False
