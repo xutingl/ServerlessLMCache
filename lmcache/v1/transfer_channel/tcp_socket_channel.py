@@ -37,6 +37,7 @@ class TcpSocketWriteHeader(msgspec.Struct, tag=True):
     req_id: str
     write_id: int
     remote_indexes: list[int]
+    remote_capacities: list[int]
     payload_sizes: list[int]
 
 
@@ -71,7 +72,7 @@ class _PendingTcpSocketWrite:
 
 
 class TcpSocketChannel(PySocketChannel):
-    """ZMQ/TCP data-plane channel that writes directly into its paged buffer."""
+    """ZMQ/TCP data-plane channel that writes directly into its receive buffer."""
 
     def __init__(self, async_mode: bool = False, **kwargs):
         super().__init__(async_mode=async_mode, **kwargs)
@@ -161,11 +162,17 @@ class TcpSocketChannel(PySocketChannel):
             raise ValueError("TcpSocketChannel requires transfer_spec.receiver_data_url")
 
         remote_indexes = list(transfer_spec["remote_indexes"])
+        remote_capacities = list(transfer_spec["remote_capacities"])
         payloads = [_memory_obj_to_buffer(obj) for obj in objects]
         if len(remote_indexes) != len(payloads):
             raise ValueError(
                 "remote_indexes length must match objects length: "
                 f"{len(remote_indexes)} != {len(payloads)}"
+            )
+        if len(remote_capacities) != len(payloads):
+            raise ValueError(
+                "remote_capacities length must match objects length: "
+                f"{len(remote_capacities)} != {len(payloads)}"
             )
 
         socket = self._get_data_socket(receiver_data_url)
@@ -174,6 +181,7 @@ class TcpSocketChannel(PySocketChannel):
                 req_id=str(transfer_spec.get("req_id") or ""),
                 write_id=self._allocate_write_id(),
                 remote_indexes=remote_indexes,
+                remote_capacities=remote_capacities,
                 payload_sizes=[payload.nbytes for payload in payloads],
             )
             _send_write_stream(socket, header, payloads, self._data_chunk_bytes)
@@ -294,7 +302,7 @@ class TcpSocketChannel(PySocketChannel):
 
     def _start_data_receiver(self, data_listen_url: str) -> None:
         if self.buffer_ptr is None or self.buffer_size <= 0:
-            raise ValueError("TcpSocketChannel receiver requires a valid paged buffer")
+            raise ValueError("TcpSocketChannel receiver requires a valid buffer")
 
         buffer_type = ctypes.c_ubyte * self.buffer_size
         self._data_receiver_buffer_owner = buffer_type.from_address(self.buffer_ptr)
@@ -430,22 +438,30 @@ class TcpSocketChannel(PySocketChannel):
                 "remote_indexes length must match payload_sizes length: "
                 f"{len(header.remote_indexes)} != {len(header.payload_sizes)}"
             )
-        for remote_index, payload_size in zip(
+        if len(header.remote_capacities) != len(header.payload_sizes):
+            raise ValueError(
+                "remote_capacities length must match payload_sizes length: "
+                f"{len(header.remote_capacities)} != {len(header.payload_sizes)}"
+            )
+        for remote_offset, remote_capacity, payload_size in zip(
             header.remote_indexes,
+            header.remote_capacities,
             header.payload_sizes,
             strict=True,
         ):
-            offset = remote_index * self.align_bytes
             if (
-                remote_index < 0
+                remote_offset < 0
+                or remote_offset % self.align_bytes != 0
+                or remote_capacity <= 0
                 or payload_size <= 0
-                or payload_size > self.align_bytes
-                or offset + payload_size > self.buffer_size
+                or payload_size > remote_capacity
+                or remote_offset + remote_capacity > self.buffer_size
             ):
                 raise ValueError(
-                    "invalid paged-buffer write: "
-                    f"index={remote_index} size={payload_size} "
-                    f"page_size={self.align_bytes} buffer_size={self.buffer_size}"
+                    "invalid receive-buffer write: "
+                    f"offset={remote_offset} capacity={remote_capacity} "
+                    f"size={payload_size} alignment={self.align_bytes} "
+                    f"buffer_size={self.buffer_size}"
                 )
 
         key = (identity, header.req_id, header.write_id)
@@ -501,8 +517,8 @@ class TcpSocketChannel(PySocketChannel):
                 f"payload_size={payload_size}"
             )
 
-        remote_index = pending.header.remote_indexes[chunk_header.object_index]
-        buffer_offset = remote_index * self.align_bytes + chunk_header.offset
+        remote_offset = pending.header.remote_indexes[chunk_header.object_index]
+        buffer_offset = remote_offset + chunk_header.offset
         target = self._data_receiver_buffer[
             buffer_offset : buffer_offset + chunk_header.size
         ]
