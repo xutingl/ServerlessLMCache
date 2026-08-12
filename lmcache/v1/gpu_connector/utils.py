@@ -173,10 +173,15 @@ def need_gpu_interm_buffer(lmcache_config: LMCacheEngineConfig):
     Check if the GPU Connector needs to create an intermediate
     buffer on the GPU
     """
-    if lmcache_config.enable_pd:
-        return False
-    else:
+    if not lmcache_config.enable_pd:
         return True
+
+    # CPU-backed PD transports benefit from gathering paged KV into a contiguous
+    # GPU buffer before copy-engine DMA. GPU-backed transports can write directly.
+    pd_buffer_device = lmcache_config.pd_buffer_device
+    return pd_buffer_device is not None and pd_buffer_device.lower().startswith(
+        "cpu"
+    )
 
 
 def assert_layerwise_gpu_connector(gpu_connector: "GPUConnectorInterface"):

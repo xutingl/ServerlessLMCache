@@ -717,16 +717,14 @@ class LMCacheEngine:
         :param **kwargs: The additional arguments for the storage backend which
             will be passed into the gpu_connector.
 
-        return: A generator that yields None. In the first iteration, the
-            generator allocates the memory objects for all layers and moves
-            the KV cache of the first layer from GPU to CPU. In the next
-            iterations, it moves the KV cache of layer i from GPU to the memory
-            objects (on CPU) and puts the memory objects of layer i-1 to the
-            storage backends. In the last iteration, it puts the memory objects
-            of the last layer to the storage backends.
+        return: A generator that yields once per logical layer while the GPU
+            connector enqueues offload work. Backend puts begin after all layer
+            hooks have run; connectors may preserve per-layer transfers or fuse
+            them into one physical transfer.
         """
         layerwise_block_leases = kwargs.pop("layerwise_block_leases", None)
         req_id = self._get_req_id(kwargs)
+        detailed_offload_timing = os.environ.get("PD_BACKEND_LAYER_TIMING") == "1"
 
         def lease_ref_summary(lease: Any, limit: int = 8) -> tuple[int, str]:
             refs = getattr(lease, "refs", ())
@@ -758,16 +756,17 @@ class LMCacheEngine:
                     layer_id,
                 )
                 return None
-            block_count, block_ids = lease_ref_summary(lease)
-            logger.info(
-                "[pd-demo-block-pin] op=bind req_id=%s layer=%d blocks=%d "
-                "block_ids=%s remaining_leases=%s",
-                req_id,
-                layer_id,
-                block_count,
-                block_ids,
-                len(layerwise_block_leases),
-            )
+            if detailed_offload_timing:
+                block_count, block_ids = lease_ref_summary(lease)
+                logger.info(
+                    "[pd-demo-block-pin] op=bind req_id=%s layer=%d blocks=%d "
+                    "block_ids=%s remaining_leases=%s",
+                    req_id,
+                    layer_id,
+                    block_count,
+                    block_ids,
+                    len(layerwise_block_leases),
+                )
             return lease
 
         def close_block_lease(lease: Any, layer_id: int, phase: str) -> float:
@@ -783,20 +782,27 @@ class LMCacheEngine:
                     phase,
                 )
                 return 0.0
-            release_start = time.perf_counter()
-            close()
-            release_elapsed = time.perf_counter() - release_start
-            block_count, block_ids = lease_ref_summary(lease)
-            logger.info(
-                "[pd-demo-block-pin] op=release req_id=%s layer=%d phase=%s "
-                "blocks=%d block_ids=%s release_ms=%.4f",
-                req_id,
-                layer_id,
-                phase,
-                block_count,
-                block_ids,
-                release_elapsed * 1000,
+            release_start = (
+                time.perf_counter() if detailed_offload_timing else 0.0
             )
+            close()
+            release_elapsed = (
+                time.perf_counter() - release_start
+                if detailed_offload_timing
+                else 0.0
+            )
+            if detailed_offload_timing:
+                block_count, block_ids = lease_ref_summary(lease)
+                logger.info(
+                    "[pd-demo-block-pin] op=release req_id=%s layer=%d phase=%s "
+                    "blocks=%d block_ids=%s release_ms=%.4f",
+                    req_id,
+                    layer_id,
+                    phase,
+                    block_count,
+                    block_ids,
+                    release_elapsed * 1000,
+                )
             return release_elapsed
 
         def release_remaining_block_leases(reason: str) -> None:
@@ -810,7 +816,7 @@ class LMCacheEngine:
                     break
                 close_block_lease(lease, -1, reason)
                 released += 1
-            if released:
+            if released and detailed_offload_timing:
                 logger.info(
                     "[pd-demo-block-pin] op=release_remaining req_id=%s "
                     "reason=%s leases=%d",
@@ -866,6 +872,7 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        fuse_layerwise_offload = bool(kwargs.get("fuse_layerwise_offload", False))
 
         store_timeline_enabled = (
             os.environ.get("PD_BACKEND_LAYER_TIMING") == "1"
@@ -980,6 +987,20 @@ class LMCacheEngine:
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
             keys = [list(row) for row in zip(*keys, strict=False)]
+            fused_batch_keys = (
+                [key for layer_keys in keys for key in layer_keys]
+                if fuse_layerwise_offload
+                else []
+            )
+            fused_batch_memory_objs = (
+                [
+                    memory_obj
+                    for layer_memory_objs in memory_objs
+                    for memory_obj in layer_memory_objs
+                ]
+                if fuse_layerwise_offload
+                else []
+            )
 
             # Calculate total KV size for logging
             tot_kv_size = sum(
@@ -1013,7 +1034,7 @@ class LMCacheEngine:
             )
             transfer_spec = _transfer_spec_with_chunk_ids(
                 kwargs.get("transfer_spec"),
-                chunk_ids,
+                chunk_ids * len(keys) if fuse_layerwise_offload else chunk_ids,
             )
             if transfer_spec is not None:
                 remote_prepare_start = time.perf_counter()
@@ -1022,6 +1043,24 @@ class LMCacheEngine:
                         continue
                     prepare_put = getattr(backend, "prepare_batched_put_task", None)
                     if prepare_put is None:
+                        continue
+                    if fuse_layerwise_offload:
+                        prepare_put(
+                            fused_batch_keys,
+                            fused_batch_memory_objs,
+                            transfer_spec=transfer_spec,
+                        )
+                        remote_prepare_layers += len(keys)
+                        continue
+                    prepare_layerwise = getattr(
+                        backend, "prepare_layerwise_put_tasks", None
+                    )
+                    if callable(prepare_layerwise) and prepare_layerwise(
+                        keys,
+                        memory_objs,
+                        transfer_spec=transfer_spec,
+                    ):
+                        remote_prepare_layers += len(keys)
                         continue
                     for layer_keys, layer_memory_objs in zip(
                         keys, memory_objs, strict=False
@@ -1055,7 +1094,6 @@ class LMCacheEngine:
             yield_resume_time = 0.0
             layer_connector_next_time = 0.0
             layer_step_time = 0.0
-            detailed_offload_timing = os.environ.get("PD_BACKEND_LAYER_TIMING") == "1"
             mem_obj_generator_create_start = time.perf_counter()
             mem_obj_generator = self.gpu_connector.batched_from_gpu(
                 memory_objs, starts, ends, **kwargs
@@ -1067,16 +1105,12 @@ class LMCacheEngine:
                 mem_obj_generator_create_end,
             )
 
-            def is_layerwise_offload_handle(result: Any) -> bool:
-                return isinstance(result, LayerwiseOffloadHandle)
-
             put_futures: list[Future[None]] = []
+            pending_layer_puts: list[tuple[int, LayerwiseOffloadHandle]] = []
             put_stats_lock = threading.Lock()
 
-            def submit_layer_put(
-                layer_id: int,
-                offload_handle: LayerwiseOffloadHandle,
-                block_lease: Any,
+            def submit_layer_puts(
+                entries: list[tuple[int, LayerwiseOffloadHandle, Any]],
             ) -> None:
                 nonlocal io_time
                 nonlocal put_submit_time
@@ -1085,6 +1119,20 @@ class LMCacheEngine:
                 nonlocal block_lease_release_time
                 executor = self._layerwise_put_executor
                 assert executor is not None
+                assert entries
+
+                if fuse_layerwise_offload:
+                    batch_keys = fused_batch_keys
+                    batch_memory_objs = fused_batch_memory_objs
+                else:
+                    batch_keys = [
+                        key for layer_id, _, _ in entries for key in keys[layer_id]
+                    ]
+                    batch_memory_objs = [
+                        memory_obj
+                        for layer_id, _, _ in entries
+                        for memory_obj in memory_objs[layer_id]
+                    ]
 
                 def wait_and_put() -> None:
                     nonlocal io_time
@@ -1095,26 +1143,35 @@ class LMCacheEngine:
                     task_start = time.perf_counter()
                     wait_start = time.perf_counter()
                     lease_release_elapsed = 0.0
-                    try:
+                    first_wait_error: Optional[BaseException] = None
+                    # The connector may fall back to independent per-layer D2H
+                    # handles when a contiguous fused destination is unavailable.
+                    # Waiting every handle is therefore required for correctness;
+                    # fused handles share one event, so repeats are already-ready.
+                    for _, offload_handle, _ in entries:
                         try:
                             offload_handle.wait()
-                        except Exception:
-                            for memory_obj in memory_objs[layer_id]:
-                                memory_obj.ref_count_down()
-                            raise
-                    finally:
-                        wait_end = time.perf_counter()
-                        lease_release_elapsed = close_block_lease(
+                        except BaseException as exc:
+                            if first_wait_error is None:
+                                first_wait_error = exc
+                    wait_end = time.perf_counter()
+                    for layer_id, _, block_lease in entries:
+                        lease_release_elapsed += close_block_lease(
                             block_lease,
                             layer_id,
                             "d2h_done",
                         )
                     ready_wait_elapsed = wait_end - wait_start
 
+                    if first_wait_error is not None:
+                        for memory_obj in batch_memory_objs:
+                            memory_obj.ref_count_down()
+                        raise first_wait_error
+
                     put_start = time.perf_counter()
                     self.storage_manager.batched_put(
-                        keys[layer_id],
-                        memory_objs[layer_id],
+                        batch_keys,
+                        batch_memory_objs,
                         transfer_spec=transfer_spec,
                         location=self.store_location,
                     )
@@ -1130,10 +1187,11 @@ class LMCacheEngine:
                     if detailed_offload_timing:
                         logger.info(
                             "[req_id=%s] Layerwise async put step: "
-                            "layer=%d ready_wait_ms=%.4f "
+                            "first_layer=%d layers=%d ready_wait_ms=%.4f "
                             "lease_release_ms=%.4f put_submit_ms=%.4f task_ms=%.4f",
                             req_id,
-                            layer_id,
+                            entries[0][0],
+                            len(entries),
                             ready_wait_elapsed * 1000,
                             lease_release_elapsed * 1000,
                             put_elapsed * 1000,
@@ -1141,15 +1199,33 @@ class LMCacheEngine:
                         )
 
                 submit_start = time.perf_counter()
-                future = executor.submit(wait_and_put)
+                try:
+                    future = executor.submit(wait_and_put)
+                except BaseException:
+                    for layer_id, offload_handle, block_lease in entries:
+                        try:
+                            offload_handle.wait()
+                        except BaseException:
+                            pass
+                        finally:
+                            close_block_lease(
+                                block_lease,
+                                layer_id,
+                                "put_submit_failed",
+                            )
+                    for memory_obj in batch_memory_objs:
+                        memory_obj.ref_count_down()
+                    raise
                 submit_end = time.perf_counter()
                 put_futures.append(future)
                 log_store_timeline(
                     "async_put_task_submit",
                     submit_start,
                     submit_end,
-                    layer_id=layer_id,
-                    extra=f"futures={len(put_futures)}",
+                    layer_id=entries[0][0],
+                    extra=(
+                        f"layers={len(entries)} futures={len(put_futures)}"
+                    ),
                 )
 
             offload_start = time.perf_counter()
@@ -1171,13 +1247,13 @@ class LMCacheEngine:
                     offload_elapsed * 1000,
                 )
 
-            if is_layerwise_offload_handle(first_offload_handle):
+            if isinstance(first_offload_handle, LayerwiseOffloadHandle):
                 if getattr(first_offload_handle, "layer_id", 0) != 0:
                     raise RuntimeError(
                         "Layerwise offload handle order mismatch: "
                         f"expected layer 0, got {first_offload_handle.layer_id}"
                     )
-                submit_layer_put(0, first_offload_handle, pop_block_lease(0))
+                pending_layer_puts.append((0, first_offload_handle))
 
                 for layer_id in range(1, self.num_layers):
                     yield_start = time.perf_counter()
@@ -1193,7 +1269,7 @@ class LMCacheEngine:
                     gpu_offload_step_time += offload_elapsed
                     layer_connector_next_time += offload_elapsed
                     if (
-                        not is_layerwise_offload_handle(offload_handle)
+                        not isinstance(offload_handle, LayerwiseOffloadHandle)
                         or getattr(offload_handle, "layer_id", None) != layer_id
                     ):
                         raise RuntimeError(
@@ -1201,11 +1277,7 @@ class LMCacheEngine:
                             f"expected layer {layer_id}, "
                             f"got {getattr(offload_handle, 'layer_id', None)}"
                         )
-                    submit_layer_put(
-                        layer_id,
-                        offload_handle,
-                        pop_block_lease(layer_id),
-                    )
+                    pending_layer_puts.append((layer_id, offload_handle))
                     layer_end = time.perf_counter()
                     layer_step_time += layer_end - yield_end
                     if detailed_offload_timing:
@@ -1232,6 +1304,34 @@ class LMCacheEngine:
                 yield
                 final_yield_end = time.perf_counter()
                 yield_resume_time += final_yield_end - final_yield_start
+
+                # Starting a worker-side CUDA event wait while the model thread
+                # is still launching later layers serializes CUDA driver work in
+                # practice. Start backend puts only after the forward has
+                # submitted all GPU work; the fused path uses one batch while the
+                # normal path retains one put per layer.
+                if fuse_layerwise_offload:
+                    submit_layer_puts(
+                        [
+                            (
+                                layer_id,
+                                offload_handle,
+                                pop_block_lease(layer_id),
+                            )
+                            for layer_id, offload_handle in pending_layer_puts
+                        ]
+                    )
+                else:
+                    for layer_id, offload_handle in pending_layer_puts:
+                        submit_layer_puts(
+                            [
+                                (
+                                    layer_id,
+                                    offload_handle,
+                                    pop_block_lease(layer_id),
+                                )
+                            ]
+                        )
 
                 first_error: Optional[Exception] = None
                 future_wait_start = time.perf_counter()

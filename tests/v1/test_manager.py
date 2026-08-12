@@ -333,8 +333,8 @@ class TestLMCacheManagerShutdown:
 class TestLMCacheManagerHelpers:
     """Tests for LMCacheManager helper methods."""
 
-    def test_need_gpu_interm_buffer_returns_not_enable_pd(self):
-        """Test _need_gpu_interm_buffer returns opposite of enable_pd."""
+    def test_need_gpu_interm_buffer_for_cpu_backed_pd(self):
+        """CPU-backed PD uses staging while GPU-backed PD stays direct."""
         config = LMCacheEngineConfig.from_defaults()
         config.enable_pd = False
         # First Party
@@ -343,6 +343,10 @@ class TestLMCacheManagerHelpers:
         assert need_gpu_interm_buffer(config) is True
 
         config.enable_pd = True
+        config.pd_buffer_device = "cpu"
+        assert need_gpu_interm_buffer(config) is True
+
+        config.pd_buffer_device = "cuda"
         assert need_gpu_interm_buffer(config) is False
 
 

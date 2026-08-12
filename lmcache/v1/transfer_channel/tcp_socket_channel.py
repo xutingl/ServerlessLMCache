@@ -31,6 +31,10 @@ logger = init_logger(__name__)
 
 _DEFAULT_DATA_CHUNK_BYTES = 512 * 1024
 _DATA_SOCKET_HWM = 2048
+def _timing_enabled() -> bool:
+    return os.environ.get("PD_BACKEND_LAYER_TIMING") == "1" or os.environ.get(
+        "PD_BACKEND_TRANSFER_TIMING"
+    ) == "1"
 
 
 class TcpSocketWriteHeader(msgspec.Struct, tag=True):
@@ -47,6 +51,7 @@ class TcpSocketChunkHeader(msgspec.Struct, tag=True):
     object_index: int
     offset: int
     size: int
+    object_count: int = 1
 
 
 class TcpSocketWriteResponse(msgspec.Struct, tag=True):
@@ -74,8 +79,11 @@ class _PendingTcpSocketWrite:
 class TcpSocketChannel(PySocketChannel):
     """ZMQ/TCP data-plane channel that writes directly into its receive buffer."""
 
+    _timing_enabled = False
+
     def __init__(self, async_mode: bool = False, **kwargs):
         super().__init__(async_mode=async_mode, **kwargs)
+        self._timing_enabled = _timing_enabled()
         self._data_sockets: dict[tuple[int, str], zmq.Socket] = {}
         self._data_sockets_lock = threading.Lock()
         self._data_receiver_socket: Optional[zmq.Socket] = None
@@ -345,15 +353,16 @@ class TcpSocketChannel(PySocketChannel):
                     logger.exception("Failed to read TCP data control frame")
                 continue
 
-            loop_start = time.perf_counter()
+            timing_enabled = self._timing_enabled
+            loop_start = time.perf_counter() if timing_enabled else 0.0
             req_id = ""
             write_id = -1
             try:
-                stage_start = time.perf_counter()
+                stage_start = time.perf_counter() if timing_enabled else 0.0
                 message = msgspec.msgpack.decode(
                     bytes(control_frame), type=TcpSocketDataMessage
                 )
-                decode_ms = _elapsed_ms(stage_start)
+                decode_ms = _elapsed_ms(stage_start) if timing_enabled else 0.0
 
                 if isinstance(message, TcpSocketWriteHeader):
                     req_id = message.req_id
@@ -399,7 +408,7 @@ class TcpSocketChannel(PySocketChannel):
                     if self.running:
                         logger.exception("Failed to acknowledge TCP data write")
                     continue
-                if completed is None:
+                if completed is None and timing_enabled:
                     logger.info(
                         "[pd-demo-timing] receiver_data_loop "
                         "req_id=%s chunks=0 zmq_frames=0 decode_ms=%.4f "
@@ -505,6 +514,31 @@ class TcpSocketChannel(PySocketChannel):
                 f"{chunk_header.object_index} for {len(pending.header.remote_indexes)}"
             )
         payload_size = pending.header.payload_sizes[chunk_header.object_index]
+        object_end = chunk_header.object_index + chunk_header.object_count
+        if chunk_header.object_count <= 0 or object_end > len(
+            pending.header.remote_indexes
+        ):
+            raise ValueError(
+                "invalid TCP data object span: "
+                f"object_index={chunk_header.object_index} "
+                f"object_count={chunk_header.object_count}"
+            )
+        if chunk_header.object_count > 1:
+            for index in range(chunk_header.object_index, object_end - 1):
+                remote_offset = pending.header.remote_indexes[index]
+                remote_capacity = pending.header.remote_capacities[index]
+                if (
+                    pending.header.payload_sizes[index] != remote_capacity
+                    or pending.header.remote_indexes[index + 1]
+                    != remote_offset + remote_capacity
+                ):
+                    raise ValueError(
+                        "TCP data object span is not contiguous at "
+                        f"object_index={index}"
+                    )
+            payload_size = sum(
+                pending.header.payload_sizes[chunk_header.object_index : object_end]
+            )
         if (
             chunk_header.offset < 0
             or chunk_header.size <= 0
@@ -522,9 +556,10 @@ class TcpSocketChannel(PySocketChannel):
         target = self._data_receiver_buffer[
             buffer_offset : buffer_offset + chunk_header.size
         ]
-        stage_start = time.perf_counter()
+        stage_start = time.perf_counter() if self._timing_enabled else 0.0
         received = self._data_receiver_socket.recv_into(target)
-        pending.write_ms += _elapsed_ms(stage_start)
+        if self._timing_enabled:
+            pending.write_ms += _elapsed_ms(stage_start)
         if received != chunk_header.size:
             raise ValueError(
                 "payload size mismatch for TCP data chunk: "
@@ -548,10 +583,10 @@ class TcpSocketChannel(PySocketChannel):
         response: TcpSocketWriteResponse,
     ) -> float:
         assert self._data_receiver_socket is not None
-        stage_start = time.perf_counter()
+        stage_start = time.perf_counter() if self._timing_enabled else 0.0
         self._data_receiver_socket.send(identity, flags=zmq.SNDMORE)
         self._data_receiver_socket.send(msgspec.msgpack.encode(response))
-        return _elapsed_ms(stage_start)
+        return _elapsed_ms(stage_start) if self._timing_enabled else 0.0
 
     def _log_completed_write(
         self,
@@ -559,6 +594,8 @@ class TcpSocketChannel(PySocketChannel):
         response_send_ms: float,
         error: str,
     ) -> None:
+        if not self._timing_enabled:
+            return
         written = len(completed.header.remote_indexes)
         logger.info(
             "[pd-demo-timing] receiver_tcp_socket_write "
@@ -594,7 +631,13 @@ def _send_write_stream(
     chunk_bytes: int,
 ) -> None:
     socket.send(msgspec.msgpack.encode(header))
-    for object_index, payload in enumerate(payloads):
+    object_index = 0
+    while object_index < len(payloads):
+        object_count, payload = _coalesce_contiguous_payloads(
+            payloads,
+            header,
+            object_index,
+        )
         offset = 0
         while offset < payload.nbytes:
             size = min(chunk_bytes, payload.nbytes - offset)
@@ -604,19 +647,76 @@ def _send_write_stream(
                 object_index=object_index,
                 offset=offset,
                 size=size,
+                object_count=object_count,
             )
             socket.send(msgspec.msgpack.encode(chunk_header), flags=zmq.SNDMORE)
             socket.send(payload[offset : offset + size], copy=False)
             offset += size
+        object_index += object_count
+
+
+def _coalesce_contiguous_payloads(
+    payloads: list[memoryview],
+    header: TcpSocketWriteHeader,
+    start: int,
+) -> tuple[int, memoryview]:
+    """Join adjacent local and remote ranges without copying their payload."""
+
+    first = payloads[start]
+    try:
+        first_address = ctypes.addressof(ctypes.c_ubyte.from_buffer(first))
+    except (TypeError, BufferError):
+        return 1, first
+    total_size = first.nbytes
+    count = 1
+    while start + count < len(payloads):
+        previous = start + count - 1
+        current = start + count
+        if (
+            header.remote_capacities[previous] != payloads[previous].nbytes
+            or header.remote_indexes[current]
+            != header.remote_indexes[previous]
+            + header.remote_capacities[previous]
+        ):
+            break
+        try:
+            current_address = ctypes.addressof(
+                ctypes.c_ubyte.from_buffer(payloads[current])
+            )
+        except (TypeError, BufferError):
+            break
+        if current_address != first_address + total_size:
+            break
+        total_size += payloads[current].nbytes
+        count += 1
+
+    if count == 1:
+        return 1, first
+    owner = (ctypes.c_ubyte * total_size).from_address(first_address)
+    return count, memoryview(owner).cast("B")
 
 
 def _memory_obj_to_buffer(obj: Union[bytes, MemoryObj]) -> memoryview:
     if isinstance(obj, bytes):
         return memoryview(obj)
-    if not isinstance(obj, MemoryObj) or obj.tensor is None:
+    if not isinstance(obj, MemoryObj):
         raise ValueError("TcpSocketChannel can only write MemoryObj with tensor data")
 
-    tensor = obj.tensor.detach()
+    raw_data = getattr(obj, "raw_data", None)
+    if isinstance(raw_data, torch.Tensor) and raw_data.device.type == "cpu":
+        raw_bytes = raw_data.view(torch.uint8).reshape(-1)
+        logical_size = obj.get_size()
+        if logical_size > raw_bytes.numel():
+            raise ValueError(
+                "MemoryObj logical size exceeds its raw buffer: "
+                f"{logical_size} > {raw_bytes.numel()}"
+            )
+        return memoryview(raw_bytes[:logical_size].numpy())
+
+    tensor = obj.tensor
+    if tensor is None:
+        raise ValueError("TcpSocketChannel can only write MemoryObj with tensor data")
+    tensor = tensor.detach()
     if tensor.device.type != "cpu":
         tensor = tensor.cpu()
     if not tensor.is_contiguous():

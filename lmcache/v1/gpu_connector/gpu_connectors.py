@@ -51,6 +51,54 @@ class LayerwiseOffloadHandle:
         self._wait_fn()
 
 
+class _CudaEventLayerwiseOffloadHandle(LayerwiseOffloadHandle):
+    """Minimal event-backed handle for the layerwise single-chunk hot path."""
+
+    def __init__(
+        self,
+        layer_id: int,
+        ready_event: torch.cuda.Event,
+        device: torch.device,
+    ) -> None:
+        self.layer_id = layer_id
+        self._ready_event = ready_event
+        self._device = device
+
+    def wait(self) -> None:
+        with torch.cuda.device(self._device):
+            self._ready_event.synchronize()
+
+
+class _GPUBufferReservation:
+    """Return pooled GPU buffers only after their CUDA work is safe."""
+
+    def __init__(self, streams: List[torch.cuda.Stream]) -> None:
+        self._streams = streams
+        self._memory_objs: List[MemoryObj] = []
+        self._released = False
+        self._lock = threading.Lock()
+
+    def add(self, memory_obj: MemoryObj) -> None:
+        with self._lock:
+            if self._released:
+                raise RuntimeError("cannot add a GPU buffer to a released reservation")
+            self._memory_objs.append(memory_obj)
+
+    def release(self, *, synchronize: bool) -> None:
+        with self._lock:
+            if self._released:
+                return
+            if synchronize:
+                for stream in self._streams:
+                    stream.synchronize()
+            memory_objs = self._memory_objs
+            self._memory_objs = []
+            self._released = True
+
+        for memory_obj in memory_objs:
+            memory_obj.ref_count_down()
+
+
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -212,6 +260,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         self.store_stream = torch.cuda.Stream()
         self.load_stream = torch.cuda.Stream()
+        self._store_lock = threading.Lock()
 
     @classmethod
     def from_metadata(
@@ -347,6 +396,12 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
     @_lmcache_nvtx_annotate
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+        # This connector owns one shared staging tensor. Keep the complete
+        # gather/copy/synchronize sequence exclusive if callers overlap.
+        with self._store_lock:
+            return self._from_gpu(memory_obj, start, end, **kwargs)
+
+    def _from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
         The kvcaches should correspond to the "WHOLE token sequence".
 
@@ -1066,6 +1121,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         )
 
         self.gpu_buffer_allocator = None
+        self._gpu_buffer_init_lock = threading.Lock()
 
         assert "chunk_size" in kwargs, (
             "chunk_size should be provided to create a GPU buffer."
@@ -1083,7 +1139,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         self.load_stream = torch.cuda.Stream()
         self.layerwise_store_stream_count = int(
-            os.getenv("LMCACHE_LAYERWISE_STORE_STREAMS", "1")
+            os.getenv("LMCACHE_LAYERWISE_STORE_STREAMS", "2")
         )
         if self.layerwise_store_stream_count < 1:
             raise ValueError("LMCACHE_LAYERWISE_STORE_STREAMS must be positive")
@@ -1091,12 +1147,19 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             torch.cuda.Stream(device=self.device)
             for _ in range(self.layerwise_store_stream_count)
         ]
-        self.store_stream = self.store_streams[0]
         self.chunk_copy_stream_count = int(
             os.getenv("LMCACHE_CHUNK_COPY_STREAMS", "64")
         )
         if self.chunk_copy_stream_count < 1:
             raise ValueError("LMCACHE_CHUNK_COPY_STREAMS must be positive")
+        if self.chunk_copy_stream_count < self.layerwise_store_stream_count:
+            raise ValueError(
+                "LMCACHE_CHUNK_COPY_STREAMS must be at least "
+                "LMCACHE_LAYERWISE_STORE_STREAMS"
+            )
+        self.chunk_copy_streams_per_store = (
+            self.chunk_copy_stream_count // self.layerwise_store_stream_count
+        )
         self.chunk_copy_streams = [
             torch.cuda.Stream(device=self.device)
             for _ in range(self.chunk_copy_stream_count)
@@ -1153,7 +1216,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         the gpu buffer size in gpu connector.
         Also, the first request might be a bit slower due to buffer creation.
         """
-        if self.use_gpu and self.gpu_buffer_allocator is None:
+        if not self.use_gpu or self.gpu_buffer_allocator is not None:
+            return
+
+        with self._gpu_buffer_init_lock:
+            if self.gpu_buffer_allocator is not None:
+                return
             logger.info("Lazily initializing GPU buffer.")
             # NOTE (Jiayi): We use the first layer to determine the gpu buffer size.
             # NOTE (Jiayi): Using the exact number of tokens in the first layer
@@ -1186,7 +1254,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 gpu_buffer_size, device=self.device
             )
 
-    def _select_layerwise_store_stream(self, layer_id: int) -> tuple[int, torch.cuda.Stream]:
+    def _select_layerwise_store_stream(
+        self, layer_id: int
+    ) -> tuple[int, torch.cuda.Stream]:
         stream_id = (layer_id * 2654435761) % self.layerwise_store_stream_count
         return stream_id, self.store_streams[stream_id]
 
@@ -1276,6 +1346,25 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
 
+        reservation = _GPUBufferReservation(
+            [self.load_stream] if self.use_gpu else []
+        )
+        generator = self._batched_to_gpu_impl(
+            starts,
+            ends,
+            _gpu_buffer_reservation=reservation,
+            **kwargs,
+        )
+        try:
+            yield from generator
+        finally:
+            # On cancellation the generator may still have H2D work in flight.
+            reservation.release(synchronize=True)
+
+    def _batched_to_gpu_impl(self, starts: List[int], ends: List[int], **kwargs):
+        reservation: _GPUBufferReservation = kwargs.pop(
+            "_gpu_buffer_reservation"
+        )
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
@@ -1308,9 +1397,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
                 buffer_shape, self.dtype, MemoryFormat.KV_T2D
             )
-            assert tmp_gpu_buffer_obj is not None, (
-                "Failed to allocate GPU buffer in GPUConnector"
-            )
+            if tmp_gpu_buffer_obj is None:
+                raise RuntimeError("Failed to allocate GPU buffer in GPUConnector")
+            reservation.add(tmp_gpu_buffer_obj)
             assert tmp_gpu_buffer_obj.tensor is not None
 
         offset = starts[0]
@@ -1369,14 +1458,38 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             current_stream.wait_stream(self.load_stream)
 
         # free the buffer memory
-        if tmp_gpu_buffer_obj is not None:
-            tmp_gpu_buffer_obj.ref_count_down()
+        reservation.release(synchronize=True)
 
         logger.debug(f"Finished loading all {self.num_layers} layers.")
         yield
 
     @_lmcache_nvtx_annotate
     def batched_from_gpu(
+        self,
+        memory_objs: Union[List[List[MemoryObj]]],
+        starts: List[int],
+        ends: List[int],
+        **kwargs,
+    ):
+        reservation = _GPUBufferReservation(
+            [*self.store_streams, *self.chunk_copy_streams]
+            if self.use_gpu
+            else []
+        )
+        generator = self._batched_from_gpu_impl(
+            memory_objs,
+            starts,
+            ends,
+            _gpu_buffer_reservation=reservation,
+            **kwargs,
+        )
+        try:
+            yield from generator
+        finally:
+            # A cancelled save may have already submitted gather/D2H work.
+            reservation.release(synchronize=True)
+
+    def _batched_from_gpu_impl(
         self,
         memory_objs: Union[List[List[MemoryObj]]],
         starts: List[int],
@@ -1407,6 +1520,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
 
+        reservation: _GPUBufferReservation = kwargs.pop(
+            "_gpu_buffer_reservation"
+        )
         setup_start = time.perf_counter()
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
@@ -1430,11 +1546,37 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         self._lazy_initialize_buffer(self.kvcaches)
 
-        slot_mapping_chunks = []
-        for start, end in zip(starts, ends, strict=False):
-            slot_mapping_chunks.append(slot_mapping[start:end])
+        if len(starts) == 1:
+            slot_mapping_full = slot_mapping[starts[0] : ends[0]]
+        else:
+            slot_mapping_chunks = []
+            for start, end in zip(starts, ends, strict=False):
+                slot_mapping_chunks.append(slot_mapping[start:end])
+            slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
 
-        slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
+        num_tokens = len(slot_mapping_full)
+        fuse_layerwise_offload = bool(kwargs.get("fuse_layerwise_offload", False))
+
+        if (
+            fuse_layerwise_offload
+            and self.use_gpu
+            and not self.use_cpu_staging
+            and not skip_d2h
+            and len(starts) == 1
+            and len(ends) == 1
+            and len(memory_objs) == self.num_layers
+            and all(len(layer_objs) == 1 for layer_objs in memory_objs)
+        ):
+            fused_destination = self._fused_layerwise_destination(memory_objs)
+            if fused_destination is not None:
+                yield from self._batched_from_gpu_fused_layers(
+                    memory_objs=memory_objs,
+                    slot_mapping=slot_mapping_full,
+                    destination=fused_destination,
+                    reservation=reservation,
+                    req_id=kwargs.get("req_id"),
+                )
+                return
 
         staging_starts = []
         staging_ends = []
@@ -1444,10 +1586,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             staging_cursor += end - start
             staging_ends.append(staging_cursor)
 
-        num_tokens = len(slot_mapping_full)
         buffer_shape = self.get_shape(num_tokens)
 
-        tmp_gpu_buffer_objs: list[MemoryObj] = []
         tmp_gpu_buffer_tensors: list[torch.Tensor] = []
         if self.use_gpu and not skip_d2h:
             assert self.gpu_buffer_allocator is not None
@@ -1455,12 +1595,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 tmp_gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
                     buffer_shape, self.dtype, MemoryFormat.KV_T2D
                 )
-                assert tmp_gpu_buffer_obj is not None, (
-                    "Failed to allocate GPU buffer in GPUConnector"
-                )
+                if tmp_gpu_buffer_obj is None:
+                    raise RuntimeError("Failed to allocate GPU buffer in GPUConnector")
+                reservation.add(tmp_gpu_buffer_obj)
                 tmp_gpu_buffer_tensor = tmp_gpu_buffer_obj.tensor
                 assert tmp_gpu_buffer_tensor is not None
-                tmp_gpu_buffer_objs.append(tmp_gpu_buffer_obj)
                 tmp_gpu_buffer_tensors.append(tmp_gpu_buffer_tensor)
 
         destination_is_pinned: Optional[bool] = None
@@ -1469,6 +1608,29 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         use_cpu_staging = (
             self.use_cpu_staging and self.use_gpu and sync and not skip_d2h
         )
+        connector_timeline_enabled = (
+            os.environ.get("PD_BACKEND_LAYER_TIMING") == "1"
+            or os.environ.get("PD_BACKEND_CONNECTOR_TIMELINE") == "1"
+        )
+        if (
+            not connector_timeline_enabled
+            and self.use_gpu
+            and not use_cpu_staging
+            and not skip_d2h
+            and len(starts) == 1
+            and len(ends) == 1
+            and len(memory_objs) == self.num_layers
+            and all(len(layer_objs) == 1 for layer_objs in memory_objs)
+        ):
+            yield from self._batched_from_gpu_single_chunk_fast(
+                memory_objs=memory_objs,
+                slot_mapping=slot_mapping_full,
+                tmp_gpu_buffer_tensors=tmp_gpu_buffer_tensors,
+                reservation=reservation,
+                req_id=kwargs.get("req_id"),
+            )
+            return
+
         cpu_staging_tensor: Optional[torch.Tensor] = None
         cpu_staging_allocation_time = 0.0
         cpu_view_creation_time = 0.0
@@ -1496,18 +1658,26 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         stream_dependency_gpu_time_ms = 0.0
         gather_gpu_time_ms = 0.0
         d2h_gpu_time_ms = 0.0
-        gpu_timing = sync
-        connector_timeline_enabled = (
-            os.environ.get("PD_BACKEND_LAYER_TIMING") == "1"
-            or os.environ.get("PD_BACKEND_CONNECTOR_TIMELINE") == "1"
-        )
+        # CUDA timing events are diagnostic instrumentation, not part of the
+        # synchronization contract. Creating and querying them for every layer
+        # adds measurable host overhead even when timeline logging is disabled.
+        gpu_timing = sync and connector_timeline_enabled
         num_chunks_per_layer = len(memory_objs[0]) if memory_objs else 0
+        single_chunk_same_stream = (
+            self.use_gpu
+            and not use_cpu_staging
+            and not skip_d2h
+            and num_chunks_per_layer == 1
+        )
         effective_copy_stream_count = min(
-            self.chunk_copy_stream_count, num_chunks_per_layer
+            self.chunk_copy_streams_per_store, num_chunks_per_layer
         )
         active_copy_stream_count = (
             effective_copy_stream_count
-            if self.use_gpu and not use_cpu_staging and not skip_d2h
+            if self.use_gpu
+            and not use_cpu_staging
+            and not skip_d2h
+            and not single_chunk_same_stream
             else 0
         )
         offload_handles: list[LayerwiseOffloadHandle] = []
@@ -1516,11 +1686,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         def select_layer_copy_streams(store_stream_id: int) -> list[torch.cuda.Stream]:
             if active_copy_stream_count == 0:
                 return []
-            stream_start = store_stream_id * active_copy_stream_count
+            stream_start = store_stream_id * self.chunk_copy_streams_per_store
             return [
-                self.chunk_copy_streams[
-                    (stream_start + offset) % self.chunk_copy_stream_count
-                ]
+                self.chunk_copy_streams[stream_start + offset]
                 for offset in range(active_copy_stream_count)
             ]
 
@@ -1620,7 +1788,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             )
             ready_event = torch.cuda.Event(enable_timing=gpu_timing)
             copy_ready_event = (
-                torch.cuda.Event() if self.use_gpu and not use_cpu_staging else None
+                torch.cuda.Event() if active_copy_stream_count else None
             )
             layer_cpu_staging_allocation_time = 0.0
             layer_wait_stream_call_time = 0.0
@@ -1697,7 +1865,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     layer_staging_d2h_submit_time += staging_submit_elapsed
                 elif self.use_gpu:
                     assert tmp_gpu_buffer_tensor is not None
-                    assert copy_ready_event is not None
                     for chunk_id, (start, end, memory_obj) in enumerate(
                         zip(starts, ends, memory_objs_layer, strict=False)
                     ):
@@ -1712,6 +1879,22 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             destination_is_pinned = destination.is_pinned()
                             destination_is_contiguous = destination.is_contiguous()
                             source_is_contiguous = source.is_contiguous()
+                        if single_chunk_same_stream:
+                            copy_call_start = time.perf_counter()
+                            destination.copy_(source, non_blocking=True)
+                            copy_call_time = time.perf_counter() - copy_call_start
+                            copy_call_times.append(copy_call_time)
+                            layer_copy_call_time += copy_call_time
+                            layer_copy_count += 1
+                            first_eight_copy_call_time += copy_call_time
+                            first_eight_copy_count += 1
+                            last_eight_copy_call_time += copy_call_time
+                            last_eight_copy_count += 1
+                            if self.use_mla:
+                                memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+                            continue
+
+                        assert copy_ready_event is not None
                         copy_stream = selected_copy_streams[
                             chunk_id % active_copy_stream_count
                         ]
@@ -2008,9 +2191,271 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         )
 
         # free the buffer memory
-        for tmp_gpu_buffer_obj in tmp_gpu_buffer_objs:
-            tmp_gpu_buffer_obj.ref_count_down()
+        reservation.release(synchronize=False)
 
+        yield
+
+    def _batched_from_gpu_single_chunk_fast(
+        self,
+        *,
+        memory_objs: List[List[MemoryObj]],
+        slot_mapping: torch.Tensor,
+        tmp_gpu_buffer_tensors: list[torch.Tensor],
+        reservation: _GPUBufferReservation,
+        req_id: Optional[str],
+    ):
+        """Enqueue one gather and D2H per layer without diagnostic bookkeeping."""
+
+        assert self.kvcaches is not None
+        current_stream = torch.cuda.current_stream()
+        offload_handles: list[LayerwiseOffloadHandle] = []
+        profile_submits = os.getenv("PD_BACKEND_FAST_D2H_SUBMIT_TIMING") == "1"
+        select_time = 0.0
+        event_create_time = 0.0
+        stream_switch_time = 0.0
+        wait_stream_time = 0.0
+        gather_submit_time = 0.0
+        copy_submit_time = 0.0
+        event_record_time = 0.0
+        other_time = 0.0
+        layer_submit_times: list[float] = []
+
+        for layer_id in range(self.num_layers):
+            layer_start = time.perf_counter() if profile_submits else 0.0
+            select_start = time.perf_counter() if profile_submits else 0.0
+            store_stream_id, store_stream = self._select_layerwise_store_stream(
+                layer_id
+            )
+            gpu_buffer = tmp_gpu_buffer_tensors[store_stream_id]
+            memory_obj = memory_objs[layer_id][0]
+            destination = memory_obj.tensor
+            assert destination is not None
+            if profile_submits:
+                select_time += time.perf_counter() - select_start
+                event_create_start = time.perf_counter()
+            ready_event = torch.cuda.Event()
+            if profile_submits:
+                event_create_time += time.perf_counter() - event_create_start
+                stream_switch_start = time.perf_counter()
+            torch.cuda.set_stream(store_stream)
+            if profile_submits:
+                stream_switch_time += time.perf_counter() - stream_switch_start
+            try:
+                wait_stream_start = time.perf_counter() if profile_submits else 0.0
+                store_stream.wait_stream(current_stream)
+                if profile_submits:
+                    wait_stream_time += time.perf_counter() - wait_stream_start
+                    gather_start = time.perf_counter()
+                lmc_ops.single_layer_kv_transfer(
+                    gpu_buffer,
+                    self.kvcaches[layer_id],
+                    slot_mapping,
+                    lmc_ops.TransferDirection.D2H,
+                    self.gpu_kv_format,
+                    token_major=True,
+                )
+                if profile_submits:
+                    gather_submit_time += time.perf_counter() - gather_start
+                    copy_start = time.perf_counter()
+                destination.copy_(gpu_buffer, non_blocking=True)
+                if profile_submits:
+                    copy_submit_time += time.perf_counter() - copy_start
+                    record_start = time.perf_counter()
+                ready_event.record(store_stream)
+                if profile_submits:
+                    event_record_time += time.perf_counter() - record_start
+            finally:
+                restore_stream_start = (
+                    time.perf_counter() if profile_submits else 0.0
+                )
+                torch.cuda.set_stream(current_stream)
+                if profile_submits:
+                    stream_switch_time += (
+                        time.perf_counter() - restore_stream_start
+                    )
+
+            if profile_submits:
+                layer_end = time.perf_counter()
+                layer_elapsed = layer_end - layer_start
+                layer_submit_times.append(layer_elapsed)
+
+            if self.use_mla:
+                memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+            offload_handle = _CudaEventLayerwiseOffloadHandle(
+                layer_id,
+                ready_event,
+                self.device,
+            )
+            offload_handles.append(offload_handle)
+            yield offload_handle
+
+        if profile_submits:
+            measured_time = (
+                select_time
+                + event_create_time
+                + stream_switch_time
+                + wait_stream_time
+                + gather_submit_time
+                + copy_submit_time
+                + event_record_time
+            )
+            total_submit_time = sum(layer_submit_times)
+            other_time = max(0.0, total_submit_time - measured_time)
+            sorted_layer_times = sorted(layer_submit_times)
+            p50 = statistics.median(sorted_layer_times)
+            p95 = sorted_layer_times[int(0.95 * (len(sorted_layer_times) - 1))]
+            logger.info(
+                "[req_id=%s] Layerwise fast D2H submit breakdown: layers=%d "
+                "total_ms=%.4f select_ms=%.4f event_create_ms=%.4f "
+                "stream_switch_ms=%.4f wait_stream_ms=%.4f "
+                "gather_submit_ms=%.4f copy_submit_ms=%.4f "
+                "event_record_ms=%.4f other_ms=%.4f "
+                "layer_p50_ms=%.4f layer_p95_ms=%.4f layer_max_ms=%.4f",
+                req_id,
+                self.num_layers,
+                total_submit_time * 1000,
+                select_time * 1000,
+                event_create_time * 1000,
+                stream_switch_time * 1000,
+                wait_stream_time * 1000,
+                gather_submit_time * 1000,
+                copy_submit_time * 1000,
+                event_record_time * 1000,
+                other_time * 1000,
+                p50 * 1000,
+                p95 * 1000,
+                max(layer_submit_times) * 1000,
+            )
+
+        for offload_handle in offload_handles:
+            offload_handle.wait()
+
+        reservation.release(synchronize=False)
+        yield
+
+    def _fused_layerwise_destination(
+        self,
+        memory_objs: List[List[MemoryObj]],
+    ) -> Optional[torch.Tensor]:
+        """Return one pinned view when all per-layer objects are contiguous."""
+
+        flat_memory_objs = [layer_objs[0] for layer_objs in memory_objs]
+        if not flat_memory_objs or any(
+            not isinstance(memory_obj, TensorMemoryObj)
+            or memory_obj.raw_data.device.type != "cpu"
+            or memory_obj.raw_data.dtype != torch.uint8
+            or not memory_obj.raw_data.is_contiguous()
+            or memory_obj.raw_data.numel() != memory_obj.get_size()
+            for memory_obj in flat_memory_objs
+        ):
+            return None
+
+        parent = flat_memory_objs[0].parent()
+        if parent is None or any(
+            memory_obj.parent() is not parent for memory_obj in flat_memory_objs
+        ):
+            return None
+
+        expected_ptr = flat_memory_objs[0].raw_data.data_ptr()
+        total_bytes = 0
+        for memory_obj in flat_memory_objs:
+            raw_data = memory_obj.raw_data
+            if raw_data.data_ptr() != expected_ptr:
+                return None
+            size = memory_obj.get_size()
+            expected_ptr += size
+            total_bytes += size
+
+        first_raw_data = flat_memory_objs[0].raw_data
+        return first_raw_data.as_strided((total_bytes,), (1,))
+
+    def _batched_from_gpu_fused_layers(
+        self,
+        *,
+        memory_objs: List[List[MemoryObj]],
+        slot_mapping: torch.Tensor,
+        destination: torch.Tensor,
+        reservation: _GPUBufferReservation,
+        req_id: Optional[str],
+    ):
+        """Gather all layers into one GPU buffer and issue one contiguous D2H."""
+
+        assert self.kvcaches is not None
+        assert self.gpu_buffer_allocator is not None
+        num_tokens = len(slot_mapping)
+        if self.use_mla:
+            fused_shape = torch.Size(
+                [self.num_layers, num_tokens, self.hidden_dim_size]
+            )
+        else:
+            fused_shape = torch.Size(
+                [self.num_layers, num_tokens, 2, self.hidden_dim_size]
+            )
+
+        gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
+            fused_shape,
+            self.dtype,
+            MemoryFormat.KV_T2D,
+        )
+        if gpu_buffer_obj is None:
+            raise RuntimeError(
+                "Failed to allocate fused layerwise GPU buffer in GPUConnector"
+            )
+        reservation.add(gpu_buffer_obj)
+        gpu_buffer = gpu_buffer_obj.tensor
+        assert gpu_buffer is not None
+
+        current_stream = torch.cuda.current_stream()
+        layer_ids_by_stream: list[list[int]] = [
+            [] for _ in range(self.layerwise_store_stream_count)
+        ]
+        for layer_id in range(self.num_layers):
+            store_stream_id, _ = self._select_layerwise_store_stream(layer_id)
+            layer_ids_by_stream[store_stream_id].append(layer_id)
+        gather_done_events: list[torch.cuda.Event] = []
+        for store_stream_id, store_stream in enumerate(self.store_streams):
+            layer_ids = layer_ids_by_stream[store_stream_id]
+            if not layer_ids:
+                continue
+            with torch.cuda.stream(store_stream):
+                store_stream.wait_stream(current_stream)
+                for layer_id in layer_ids:
+                    lmc_ops.single_layer_kv_transfer(
+                        gpu_buffer[layer_id],
+                        self.kvcaches[layer_id],
+                        slot_mapping,
+                        lmc_ops.TransferDirection.D2H,
+                        self.gpu_kv_format,
+                        token_major=True,
+                    )
+                gather_done_event = torch.cuda.Event()
+                gather_done_event.record(store_stream)
+                gather_done_events.append(gather_done_event)
+
+        copy_stream_id = hash(str(req_id or "")) % self.chunk_copy_stream_count
+        copy_stream = self.chunk_copy_streams[copy_stream_id]
+        ready_event = torch.cuda.Event()
+        with torch.cuda.stream(copy_stream):
+            for gather_done_event in gather_done_events:
+                copy_stream.wait_event(gather_done_event)
+            destination_tensor = destination.view(self.dtype).view(fused_shape)
+            destination_tensor.copy_(gpu_buffer, non_blocking=True)
+            ready_event.record(copy_stream)
+
+        if self.use_mla:
+            for layer_objs in memory_objs:
+                layer_objs[0].metadata.fmt = MemoryFormat.KV_MLA_FMT
+
+        for layer_id in range(self.num_layers):
+            yield _CudaEventLayerwiseOffloadHandle(
+                layer_id,
+                ready_event,
+                self.device,
+            )
+
+        with torch.cuda.device(self.device):
+            ready_event.synchronize()
+        reservation.release(synchronize=False)
         yield
 
     def get_shape(self, num_tokens: int) -> torch.Size:

@@ -11,6 +11,7 @@ import torch
 
 # First Party
 from lmcache.v1.gpu_connector.gpu_connectors import (
+    _GPUBufferReservation,
     SGLangGPUConnector,
     VLLMBufferLayerwiseGPUConnector,
     VLLMPagedMemGPUConnectorV2,
@@ -58,6 +59,173 @@ from .utils import (
     generate_sglang_kv_cache_paged_list_tensors,
     recover_gpu_connector_states,
 )
+
+
+def test_gpu_buffer_reservation_synchronizes_before_reuse():
+    operations = []
+
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def synchronize(self):
+            operations.append(f"sync:{self.name}")
+
+    class FakeMemoryObj:
+        def ref_count_down(self):
+            operations.append("release")
+
+    reservation = _GPUBufferReservation([FakeStream("store"), FakeStream("copy")])
+    reservation.add(FakeMemoryObj())
+    reservation.release(synchronize=True)
+    reservation.release(synchronize=True)
+
+    assert operations == ["sync:store", "sync:copy", "release"]
+
+
+def test_layerwise_store_generator_close_drains_before_reuse():
+    operations = []
+
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def synchronize(self):
+            operations.append(f"sync:{self.name}")
+
+    class FakeMemoryObj:
+        def ref_count_down(self):
+            operations.append("release")
+
+    connector = object.__new__(VLLMPagedMemLayerwiseGPUConnector)
+    connector.use_gpu = True
+    connector.store_streams = [FakeStream("store")]
+    connector.chunk_copy_streams = [FakeStream("copy")]
+
+    def fake_batched_from_gpu_impl(memory_objs, starts, ends, **kwargs):
+        reservation = kwargs.pop("_gpu_buffer_reservation")
+        reservation.add(FakeMemoryObj())
+        yield "submitted"
+
+    connector._batched_from_gpu_impl = fake_batched_from_gpu_impl
+    generator = connector.batched_from_gpu([], [], [])
+    assert next(generator) == "submitted"
+    generator.close()
+
+    assert operations == ["sync:store", "sync:copy", "release"]
+
+
+def test_layerwise_gpu_buffer_lazy_initialization_is_serialized():
+    connector = object.__new__(VLLMPagedMemLayerwiseGPUConnector)
+    connector.use_gpu = True
+    connector.gpu_buffer_allocator = None
+    connector._gpu_buffer_init_lock = threading.Lock()
+    connector.layout_hints = {}
+    connector.element_size = 2
+    connector.layerwise_store_stream_count = 2
+    connector.device = "cuda"
+
+    allocator_calls = []
+    allocator_entered = threading.Event()
+    second_allocator_entered = threading.Event()
+    allow_allocator_return = threading.Event()
+
+    def fake_allocator(size, device):
+        allocator_calls.append((size, device))
+        if len(allocator_calls) == 2:
+            second_allocator_entered.set()
+        allocator_entered.set()
+        assert allow_allocator_return.wait(timeout=1)
+        return object()
+
+    def initialize():
+        connector._lazy_initialize_buffer([object()])
+
+    with (
+        patch(
+            "lmcache.v1.gpu_connector.gpu_connectors.ensure_contiguous_kv_caches",
+            side_effect=lambda value, **_: value,
+        ),
+        patch(
+            "lmcache.v1.gpu_connector.gpu_connectors.discover_gpu_kv_format",
+            return_value=object(),
+        ),
+        patch(
+            "lmcache.v1.gpu_connector.gpu_connectors."
+            "assert_is_vllm_flash_attn_or_flash_infer"
+        ),
+        patch(
+            "lmcache.v1.gpu_connector.gpu_connectors.get_tokens_per_layer",
+            return_value=8,
+        ),
+        patch(
+            "lmcache.v1.gpu_connector.gpu_connectors.get_elements_per_layer",
+            return_value=16,
+        ),
+        patch(
+            "lmcache.v1.gpu_connector.gpu_connectors.GPUMemoryAllocator",
+            side_effect=fake_allocator,
+        ),
+    ):
+        first = threading.Thread(target=initialize)
+        second = threading.Thread(target=initialize)
+        first.start()
+        assert allocator_entered.wait(timeout=1)
+        second.start()
+
+        assert not second_allocator_entered.wait(timeout=0.1)
+        assert len(allocator_calls) == 1
+        allow_allocator_return.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert allocator_calls == [(64, "cuda")]
+
+
+def test_fused_layerwise_destination_requires_contiguous_exact_allocations():
+    allocator = TensorMemoryAllocator(torch.empty(3 * 4096, dtype=torch.uint8))
+    memory_objs = allocator.batched_allocate(
+        torch.Size([16, 2, 64]),
+        torch.float16,
+        batch_size=3,
+        fmt=MemoryFormat.KV_T2D,
+    )
+    assert memory_objs is not None
+    connector = object.__new__(VLLMPagedMemLayerwiseGPUConnector)
+
+    destination = connector._fused_layerwise_destination(
+        [[memory_obj] for memory_obj in memory_objs]
+    )
+
+    assert destination is not None
+    assert destination.numel() == 3 * 4096
+    assert destination.data_ptr() == memory_objs[0].raw_data.data_ptr()
+    for memory_obj in memory_objs:
+        memory_obj.ref_count_down()
+    assert allocator.memcheck()
+
+
+def test_fused_layerwise_destination_rejects_noncontiguous_order():
+    allocator = TensorMemoryAllocator(torch.empty(3 * 4096, dtype=torch.uint8))
+    memory_objs = allocator.batched_allocate(
+        torch.Size([16, 2, 64]),
+        torch.float16,
+        batch_size=3,
+        fmt=MemoryFormat.KV_T2D,
+    )
+    assert memory_objs is not None
+    connector = object.__new__(VLLMPagedMemLayerwiseGPUConnector)
+
+    destination = connector._fused_layerwise_destination(
+        [[memory_objs[0]], [memory_objs[2]], [memory_objs[1]]]
+    )
+
+    assert destination is None
+    for memory_obj in memory_objs:
+        memory_obj.ref_count_down()
+    assert allocator.memcheck()
 
 
 @pytest.fixture(autouse=True, scope="module")
