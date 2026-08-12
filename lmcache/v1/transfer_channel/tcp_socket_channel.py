@@ -2,16 +2,23 @@
 
 import asyncio
 import ctypes
+import ctypes.util
 from dataclasses import dataclass
 import os
+from pathlib import Path
 import threading
 import time
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 # Third Party
 import msgspec
 import torch
 import zmq
+
+try:
+    from pd_zmq_transport import ZmqSender as _NativeZmqSender
+except ImportError:
+    _NativeZmqSender = None
 
 # First Party
 from lmcache.v1.memory_management import MemoryObj
@@ -31,6 +38,8 @@ logger = init_logger(__name__)
 
 _DEFAULT_DATA_CHUNK_BYTES = 512 * 1024
 _DATA_SOCKET_HWM = 2048
+
+
 def _timing_enabled() -> bool:
     return os.environ.get("PD_BACKEND_LAYER_TIMING") == "1" or os.environ.get(
         "PD_BACKEND_TRANSFER_TIMING"
@@ -86,6 +95,9 @@ class TcpSocketChannel(PySocketChannel):
         self._timing_enabled = _timing_enabled()
         self._data_sockets: dict[tuple[int, str], zmq.Socket] = {}
         self._data_sockets_lock = threading.Lock()
+        self._native_data_senders: dict[int, Any] = {}
+        self._native_data_senders_lock = threading.Lock()
+        self._native_sender_library = self._configure_native_sender()
         self._data_receiver_socket: Optional[zmq.Socket] = None
         self._data_receiver_thread: Optional[threading.Thread] = None
         self._data_receiver_buffer_owner = None
@@ -183,11 +195,25 @@ class TcpSocketChannel(PySocketChannel):
                 f"{len(remote_capacities)} != {len(payloads)}"
             )
 
+        write_id = self._allocate_write_id()
+        if self._native_sender_library is not None:
+            sender = self._get_native_data_sender()
+            return int(
+                sender.batched_write(
+                    receiver_data_url,
+                    str(transfer_spec.get("req_id") or ""),
+                    write_id,
+                    remote_indexes,
+                    remote_capacities,
+                    payloads,
+                )
+            )
+
         socket = self._get_data_socket(receiver_data_url)
         try:
             header = TcpSocketWriteHeader(
                 req_id=str(transfer_spec.get("req_id") or ""),
-                write_id=self._allocate_write_id(),
+                write_id=write_id,
                 remote_indexes=remote_indexes,
                 remote_capacities=remote_capacities,
                 payload_sizes=[payload.nbytes for payload in payloads],
@@ -271,7 +297,54 @@ class TcpSocketChannel(PySocketChannel):
             self._data_sockets.clear()
         for socket in sockets:
             socket.close(linger=0)
+        with self._native_data_senders_lock:
+            native_senders = list(self._native_data_senders.values())
+            self._native_data_senders.clear()
+        for sender in native_senders:
+            sender.close()
         super().close()
+
+    def _configure_native_sender(self) -> Optional[str]:
+        mode = os.environ.get("LMCACHE_TCP_SOCKET_NATIVE_SENDER", "auto").lower()
+        if mode in {"0", "false", "off", "no"}:
+            logger.info("TCP data sender backend=python-pyzmq")
+            return None
+        required = mode in {"1", "true", "on", "yes", "required"}
+        if _NativeZmqSender is None:
+            if required:
+                raise RuntimeError(
+                    "LMCACHE_TCP_SOCKET_NATIVE_SENDER requires pd_zmq_transport"
+                )
+            logger.info(
+                "TCP data sender backend=python-pyzmq "
+                "reason=pd_zmq_transport_unavailable"
+            )
+            return None
+
+        library = _find_libzmq_library()
+        if library is None:
+            if required:
+                raise RuntimeError("Could not locate libzmq for pd_zmq_transport")
+            logger.info(
+                "TCP data sender backend=python-pyzmq reason=libzmq_unavailable"
+            )
+            return None
+        logger.info("TCP data sender backend=rust-libzmq library=%s", library)
+        return library
+
+    def _get_native_data_sender(self):
+        assert _NativeZmqSender is not None
+        assert self._native_sender_library is not None
+        thread_id = threading.get_ident()
+        with self._native_data_senders_lock:
+            sender = self._native_data_senders.get(thread_id)
+            if sender is None:
+                sender = _NativeZmqSender(
+                    self._native_sender_library,
+                    self._data_chunk_bytes,
+                )
+                self._native_data_senders[thread_id] = sender
+            return sender
 
     def _get_data_socket(self, receiver_data_url: str) -> zmq.Socket:
         key = (threading.get_ident(), receiver_data_url)
@@ -736,3 +809,17 @@ def _tcp_socket_data_chunk_bytes() -> int:
     if value <= 0:
         raise ValueError("LMCACHE_TCP_SOCKET_DATA_CHUNK_BYTES must be positive")
     return value
+
+
+def _find_libzmq_library() -> Optional[str]:
+    configured = os.environ.get("LMCACHE_LIBZMQ_PATH")
+    if configured:
+        return configured
+
+    package_root = Path(zmq.__file__).resolve().parent.parent
+    bundled = sorted((package_root / "pyzmq.libs").glob("libzmq*.so*"))
+    if bundled:
+        return str(bundled[0])
+
+    system_library = ctypes.util.find_library("zmq")
+    return str(system_library) if system_library else None
