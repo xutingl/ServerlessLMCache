@@ -1698,6 +1698,9 @@ class LMCacheEngine:
             "true",
             "yes",
         )
+        load_profile_layers_enabled = load_profile_enabled and os.getenv(
+            "LMCACHE_LOAD_PROFILE_LAYERS", "true"
+        ).lower() in ("1", "true", "yes")
 
         if mask is not None:
             num_required_tokens = torch.sum(mask).item()
@@ -1838,7 +1841,7 @@ class LMCacheEngine:
                 to_release.extend(
                     zip(keys_layer_major[layer_id], mem_objs_layer, strict=False)
                 )
-                if load_profile_enabled:
+                if load_profile_layers_enabled:
                     logger.info(
                         "[req_id=%s] Layerwise load layer=%d chunks=%d "
                         "bytes=%d submit_time=%.4f ms yield_resume_time=%.4f ms "
