@@ -43,16 +43,158 @@ if torch.cuda.is_available():
 logger = init_logger(__name__)
 
 _PD_LAYERWISE_MIN_STORE_GROUP_LAYERS = 4
-_PD_LAYERWISE_TARGET_STORE_GROUP_BYTES = 32 * 1024**2
+_PD_LAYERWISE_TARGET_STORE_GROUP_BYTES = 64 * 1024**2
 
 
 class LayerwiseOffloadHandle:
-    def __init__(self, layer_id: int, wait_fn: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        layer_id: int,
+        wait_fn: Callable[[], None],
+        request_batch: Optional[object] = None,
+    ) -> None:
         self.layer_id = layer_id
         self._wait_fn = wait_fn
+        self.request_batch = request_batch
 
     def wait(self) -> None:
         self._wait_fn()
+
+
+class _DeferredLayerwiseBatchWaiter:
+    """Resolve a layer handle after the model thread flushes its request batch."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._wait_fn: Optional[Callable[[], None]] = None
+        self._error: Optional[BaseException] = None
+
+    def resolve(self, wait_fn: Callable[[], None]) -> None:
+        with self._condition:
+            if self._wait_fn is not None or self._error is not None:
+                raise RuntimeError("layerwise request batch waiter already resolved")
+            self._wait_fn = wait_fn
+            self._condition.notify_all()
+
+    def fail(self, error: BaseException) -> None:
+        with self._condition:
+            if self._wait_fn is not None or self._error is not None:
+                return
+            self._error = error
+            self._condition.notify_all()
+
+    def wait(self) -> None:
+        with self._condition:
+            while self._wait_fn is None and self._error is None:
+                self._condition.wait()
+            error = self._error
+            wait_fn = self._wait_fn
+        if error is not None:
+            raise error
+        assert wait_fn is not None
+        wait_fn()
+
+
+class _LayerwiseRequestBatchEntry:
+    def __init__(
+        self,
+        *,
+        group_start: int,
+        group_end: int,
+        memory_objs: List[List[MemoryObj]],
+        slot_mapping: torch.Tensor,
+        req_id: Optional[str],
+    ) -> None:
+        self.group_start = group_start
+        self.group_end = group_end
+        self.memory_objs = memory_objs
+        self.slot_mapping = slot_mapping
+        self.req_id = req_id
+        self.waiter = _DeferredLayerwiseBatchWaiter()
+
+
+class LayerwiseRequestBatch:
+    """Collect one scheduler batch before launching a shared grouped D2H."""
+
+    def __init__(
+        self,
+        group_size: int,
+        flush_fn: Callable[
+            ["LayerwiseRequestBatch", list[_LayerwiseRequestBatchEntry]],
+            None,
+        ],
+    ) -> None:
+        self.group_size = group_size
+        self._flush_fn = flush_fn
+        self._lock = threading.Lock()
+        self._flush_lock = threading.Lock()
+        self._pending: list[_LayerwiseRequestBatchEntry] = []
+        self._error: Optional[BaseException] = None
+        self.layout_signature: Optional[tuple[tuple[Optional[str], int, int], ...]] = (
+            None
+        )
+        self.cpu_staging: Optional[torch.Tensor] = None
+        self.combined_slot_mapping: Optional[torch.Tensor] = None
+        self.slot_mapping_ready_event: Optional[torch.cuda.Event] = None
+        self.gpu_buffers: dict[int, torch.Tensor] = {}
+
+    def register(self, entry: _LayerwiseRequestBatchEntry) -> None:
+        with self._lock:
+            if self._error is not None:
+                raise RuntimeError(
+                    "layerwise request batch is aborted"
+                ) from self._error
+            self._pending.append(entry)
+
+    def flush(self) -> int:
+        with self._lock:
+            entries = self._pending
+            self._pending = []
+            error = self._error
+        if error is not None:
+            raise RuntimeError("layerwise request batch is aborted") from error
+        if not entries:
+            return 0
+        try:
+            with self._flush_lock:
+                self._flush_fn(self, entries)
+        except BaseException as exc:
+            for entry in entries:
+                entry.waiter.fail(exc)
+            raise
+        return len(entries)
+
+    def abort(self, error: BaseException) -> None:
+        with self._lock:
+            if self._error is None:
+                self._error = error
+            entries = self._pending
+            self._pending = []
+        for entry in entries:
+            entry.waiter.fail(error)
+
+
+class _LayerwiseBatchViewAllocator:
+    """Release one shared allocator object after all request views are done."""
+
+    def __init__(self, owner: TensorMemoryObj, view_count: int) -> None:
+        self._owner: Optional[TensorMemoryObj] = owner
+        self._remaining = view_count
+        self._lock = threading.Lock()
+
+    def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None) -> None:
+        del allocator_type
+        owner: Optional[TensorMemoryObj] = None
+        with self._lock:
+            if not memory_obj.is_valid():
+                return
+            memory_obj.invalidate()
+            self._remaining -= 1
+            if self._remaining == 0:
+                owner = self._owner
+                self._owner = None
+        if owner is not None:
+            owner.ref_count_down()
 
 
 class _CudaEventLayerwiseOffloadHandle(LayerwiseOffloadHandle):
@@ -1290,6 +1432,26 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             ),
         )
 
+    def create_layerwise_request_batch(
+        self,
+        total_tokens: int,
+    ) -> LayerwiseRequestBatch:
+        """Create a layer-major batch spanning all requests in one forward."""
+
+        bytes_per_layer = self.get_shape(total_tokens).numel() * self.element_size
+        group_size = min(
+            self.num_layers,
+            max(
+                1,
+                _PD_LAYERWISE_TARGET_STORE_GROUP_BYTES
+                // max(bytes_per_layer, 1),
+            ),
+        )
+        return LayerwiseRequestBatch(
+            group_size,
+            self._flush_layerwise_request_batch,
+        )
+
     def _replace_with_cpu_staging_views(
         self,
         memory_objs: List[MemoryObj],
@@ -1326,6 +1488,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             raise ValueError(
                 "CPU staging destinations must share one parent allocator"
             )
+        # TensorMemoryAllocator.batched_free sorts its input in place. Keep the
+        # request order intact because raw_views follows that logical order.
         parent_allocator.batched_free(list(memory_objs))
         old_buffer_free_time = time.perf_counter() - free_start
 
@@ -1617,6 +1781,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             staging_ends.append(staging_cursor)
 
         buffer_shape = self.get_shape(num_tokens)
+        layerwise_request_batch = kwargs.get("layerwise_request_batch")
         grouped_layerwise_d2h = (
             bool(kwargs.get("batch_layerwise_puts", False))
             and bool(kwargs.get("contiguous_pinned_d2h", False))
@@ -1626,10 +1791,18 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             and all(len(layer_objs) == 1 for layer_objs in memory_objs)
             and self._fused_layerwise_destination(memory_objs) is not None
         )
-        group_size = self.layerwise_store_group_size(num_tokens)
+        group_size = (
+            layerwise_request_batch.group_size
+            if isinstance(layerwise_request_batch, LayerwiseRequestBatch)
+            else self.layerwise_store_group_size(num_tokens)
+        )
 
         tmp_gpu_buffer_tensors: list[torch.Tensor] = []
-        if self.use_gpu and not skip_d2h:
+        uses_shared_gpu_buffers = (
+            grouped_layerwise_d2h and layerwise_request_batch is not None
+        )
+        # A shared request batch owns its GPU tile buffers.
+        if self.use_gpu and not skip_d2h and not uses_shared_gpu_buffers:
             if grouped_layerwise_d2h:
                 active_streams = min(
                     self.layerwise_store_stream_count,
@@ -1675,7 +1848,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             or os.environ.get("PD_BACKEND_CONNECTOR_TIMELINE") == "1"
         )
         if (
-            not connector_timeline_enabled
+            (not connector_timeline_enabled or grouped_layerwise_d2h)
             and self.use_gpu
             and not use_cpu_staging
             and not skip_d2h
@@ -1692,6 +1865,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     reservation=reservation,
                     dependency_claim=kwargs.get("layerwise_dependency_claim"),
                     group_size=group_size,
+                    request_batch=layerwise_request_batch,
+                    req_id=kwargs.get("req_id"),
                 )
                 return
             yield from self._batched_from_gpu_single_chunk_fast(
@@ -1699,7 +1874,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 slot_mapping=slot_mapping_full,
                 tmp_gpu_buffer_tensors=tmp_gpu_buffer_tensors,
                 reservation=reservation,
-                req_id=kwargs.get("req_id"),
                 dependency_claim=kwargs.get("layerwise_dependency_claim"),
                 contiguous_pinned_d2h=bool(
                     kwargs.get("contiguous_pinned_d2h", False)
@@ -2271,6 +2445,313 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         yield
 
+    def _flush_layerwise_request_batch(
+        self,
+        request_batch: LayerwiseRequestBatch,
+        entries: list[_LayerwiseRequestBatchEntry],
+    ) -> None:
+        """Launch one gather and D2H for a layer tile across requests."""
+
+        flush_start = time.perf_counter()
+        timeline_enabled = os.environ.get("PD_BACKEND_STORE_TIMELINE") == "1"
+        submit_timing_enabled = (
+            timeline_enabled
+            or os.environ.get("PD_BACKEND_AGGREGATE_TIMING") == "1"
+        )
+        if not entries:
+            return
+        group_start = entries[0].group_start
+        group_end = entries[0].group_end
+        if any(
+            entry.group_start != group_start or entry.group_end != group_end
+            for entry in entries
+        ):
+            raise RuntimeError(
+                "layerwise request batch contains mismatched layer groups"
+            )
+        if any(entry.slot_mapping.numel() == 0 for entry in entries):
+            raise RuntimeError("layerwise request batch contains an empty slot mapping")
+
+        assert self.kvcaches is not None
+        assert self.kv_cache_pointers_on_gpu is not None
+        token_counts = [int(entry.slot_mapping.numel()) for entry in entries]
+        total_tokens = sum(token_counts)
+        group_layers = group_end - group_start
+        layout_signature = tuple(
+            (entry.req_id, id(entry.memory_objs), token_count)
+            for entry, token_count in zip(entries, token_counts, strict=True)
+        )
+        if (
+            request_batch.layout_signature is not None
+            and request_batch.layout_signature != layout_signature
+        ):
+            raise RuntimeError("layerwise request batch membership changed")
+        store_stream_id, store_stream = self._select_layerwise_store_stream(
+            group_start // request_batch.group_size
+        )
+        cat_start_event = None
+        cat_done_event = None
+        cat_submit_start = time.perf_counter()
+        if request_batch.combined_slot_mapping is None:
+            with torch.cuda.stream(store_stream):
+                if timeline_enabled:
+                    cat_start_event = torch.cuda.Event(enable_timing=True)
+                    cat_done_event = torch.cuda.Event(enable_timing=True)
+                    cat_start_event.record(store_stream)
+                combined_slot_mapping = torch.cat(
+                    [entry.slot_mapping for entry in entries],
+                    dim=0,
+                )
+                if cat_done_event is not None:
+                    cat_done_event.record(store_stream)
+                slot_mapping_ready_event = torch.cuda.Event()
+                slot_mapping_ready_event.record(store_stream)
+            request_batch.combined_slot_mapping = combined_slot_mapping
+            request_batch.slot_mapping_ready_event = slot_mapping_ready_event
+        else:
+            combined_slot_mapping = request_batch.combined_slot_mapping
+            slot_mapping_ready_event = request_batch.slot_mapping_ready_event
+            assert slot_mapping_ready_event is not None
+            store_stream.wait_event(slot_mapping_ready_event)
+        cat_submit_ms = (time.perf_counter() - cat_submit_start) * 1000
+
+        gpu_alloc_start = time.perf_counter()
+        buffer_shape = self.get_shape(total_tokens)
+        gpu_buffer_owner = request_batch.gpu_buffers.get(store_stream_id)
+        if gpu_buffer_owner is None:
+            allocation_shape = torch.Size(
+                [request_batch.group_size, *buffer_shape]
+            )
+            with torch.cuda.stream(store_stream):
+                gpu_buffer_owner = torch.empty(
+                    allocation_shape,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            request_batch.gpu_buffers[store_stream_id] = gpu_buffer_owner
+        gpu_buffer = gpu_buffer_owner[:group_layers]
+        gpu_alloc_ms = (time.perf_counter() - gpu_alloc_start) * 1000
+
+        expected_sizes_by_request = [
+            token_count * self.get_shape(1).numel() * self.element_size
+            for token_count in token_counts
+        ]
+        memory_validation_start = time.perf_counter()
+        old_free_ms = 0.0
+        owner_alloc_ms = 0.0
+        view_rebind_ms = 0.0
+        if request_batch.cpu_staging is None:
+            all_memory_objs = [
+                entry.memory_objs[layer_id][0]
+                for layer_id in range(self.num_layers)
+                for entry in entries
+            ]
+            parent_allocator = all_memory_objs[0].parent()
+            if not isinstance(parent_allocator, TensorMemoryAllocator) or any(
+                not isinstance(memory_obj, TensorMemoryObj)
+                or memory_obj.parent() is not parent_allocator
+                or memory_obj.raw_data.device.type != "cpu"
+                or memory_obj.get_size()
+                != expected_sizes_by_request[index % len(entries)]
+                for index, memory_obj in enumerate(all_memory_objs)
+            ):
+                raise RuntimeError(
+                    "layerwise request batching requires allocator-owned CPU "
+                    "TensorMemoryObjs"
+                )
+            memory_format = all_memory_objs[0].metadata.fmt
+            memory_validation_ms = (
+                time.perf_counter() - memory_validation_start
+            ) * 1000
+
+            # Request-major allocations cannot provide a contiguous layer-major
+            # tile without duplicate capacity. Return the entire batch first,
+            # then replace it with one equally-sized layer-major region.
+            old_free_start = time.perf_counter()
+            parent_allocator.batched_free(list(all_memory_objs))
+            old_free_ms = (time.perf_counter() - old_free_start) * 1000
+
+            owner_alloc_start = time.perf_counter()
+            full_batch_shape = torch.Size([self.num_layers, *buffer_shape])
+            owner = parent_allocator.allocate(
+                full_batch_shape,
+                self.dtype,
+                memory_format,
+            )
+            if owner is None:
+                raise RuntimeError("failed to allocate layerwise request batch buffer")
+            full_cpu_staging = owner.tensor
+            assert full_cpu_staging is not None
+            owner_alloc_ms = (time.perf_counter() - owner_alloc_start) * 1000
+
+            view_rebind_start = time.perf_counter()
+            view_allocator = _LayerwiseBatchViewAllocator(
+                owner,
+                len(all_memory_objs),
+            )
+            for layer_id in range(self.num_layers):
+                layer_memory_objs = [
+                    entry.memory_objs[layer_id][0] for entry in entries
+                ]
+                raw_views = torch.split(
+                    full_cpu_staging[layer_id].view(torch.uint8).flatten(),
+                    expected_sizes_by_request,
+                )
+                for memory_obj, raw_view in zip(
+                    layer_memory_objs,
+                    raw_views,
+                    strict=True,
+                ):
+                    assert isinstance(memory_obj, TensorMemoryObj)
+                    memory_obj.raw_data = raw_view
+                    memory_obj.meta.address = raw_view.data_ptr()
+                    memory_obj.meta.phy_size = raw_view.numel()
+                    memory_obj.meta.ref_count = 1
+                    memory_obj.meta.pin_count = 0
+                    memory_obj.parent_allocator = view_allocator
+                    memory_obj.valid = True
+                    if self.use_mla:
+                        memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+            view_rebind_ms = (time.perf_counter() - view_rebind_start) * 1000
+            request_batch.layout_signature = layout_signature
+            request_batch.cpu_staging = full_cpu_staging
+        else:
+            memory_validation_ms = (
+                time.perf_counter() - memory_validation_start
+            ) * 1000
+        full_cpu_staging = request_batch.cpu_staging
+        assert full_cpu_staging is not None
+        cpu_staging = full_cpu_staging[group_start:group_end]
+
+        ready_event = torch.cuda.Event(enable_timing=timeline_enabled)
+        store_start_event = None
+        gather_done_event = None
+        if timeline_enabled:
+            store_start_event = torch.cuda.Event(enable_timing=True)
+            gather_done_event = torch.cuda.Event(enable_timing=True)
+        gpu_buffer.record_stream(store_stream)
+        cuda_enqueue_start = time.perf_counter()
+        gather_submit_ms = 0.0
+        d2h_submit_ms = 0.0
+        with torch.cuda.stream(store_stream):
+            # The adapter synchronizes the exact layer-group ready event before
+            # entering this function. Waiting on the default stream here would
+            # also capture later model work and destroy layerwise overlap.
+            if store_start_event is not None:
+                store_start_event.record(store_stream)
+            kernel_buffer = gpu_buffer.unsqueeze(2) if self.use_mla else gpu_buffer
+            gather_submit_start = time.perf_counter()
+            lmc_ops.multi_layer_kv_transfer_token_major(
+                kernel_buffer,
+                self.kv_cache_pointers_on_gpu[group_start:group_end],
+                combined_slot_mapping,
+                self.device,
+                self.page_buffer_size,
+                lmc_ops.TransferDirection.D2H,
+                self.gpu_kv_format,
+                block_size=self.block_size,
+                head_size=self.head_size,
+            )
+            gather_submit_ms = (
+                time.perf_counter() - gather_submit_start
+            ) * 1000
+            if gather_done_event is not None:
+                gather_done_event.record(store_stream)
+            d2h_submit_start = time.perf_counter()
+            lmc_ops.lmcache_memcpy_async(
+                cpu_staging.data_ptr(),
+                gpu_buffer.data_ptr(),
+                cpu_staging.numel() * cpu_staging.element_size(),
+                lmc_ops.TransferDirection.D2H,
+                0,
+                1 << 30,
+            )
+            d2h_submit_ms = (time.perf_counter() - d2h_submit_start) * 1000
+            ready_event.record(store_stream)
+        cuda_enqueue_ms = (time.perf_counter() - cuda_enqueue_start) * 1000
+        flush_submit_ms = (time.perf_counter() - flush_start) * 1000
+
+        if submit_timing_enabled:
+            logger.info(
+                "[pd-demo-request-batch] first_layer=%d layers=%d requests=%d "
+                "tokens=%d bytes=%d req_ids=%s",
+                group_start,
+                group_layers,
+                len(entries),
+                total_tokens,
+                cpu_staging.numel() * cpu_staging.element_size(),
+                ",".join(str(entry.req_id or "-") for entry in entries),
+            )
+            logger.info(
+                "[pd-request-batch-timing] phase=submit first_layer=%d "
+                "layers=%d requests=%d tokens=%d total_ms=%.4f "
+                "cat_submit_ms=%.4f gpu_alloc_ms=%.4f validate_ms=%.4f "
+                "owner_alloc_ms=%.4f old_free_ms=%.4f view_rebind_ms=%.4f "
+                "cuda_enqueue_ms=%.4f gather_submit_ms=%.4f "
+                "d2h_submit_ms=%.4f",
+                group_start,
+                group_layers,
+                len(entries),
+                total_tokens,
+                flush_submit_ms,
+                cat_submit_ms,
+                gpu_alloc_ms,
+                memory_validation_ms,
+                owner_alloc_ms,
+                old_free_ms,
+                view_rebind_ms,
+                cuda_enqueue_ms,
+                gather_submit_ms,
+                d2h_submit_ms,
+            )
+
+        wait_lock = threading.Lock()
+        waited = False
+
+        def wait_ready() -> None:
+            nonlocal waited
+            with wait_lock:
+                if waited:
+                    return
+                with torch.cuda.device(self.device):
+                    ready_event.synchronize()
+                if timeline_enabled:
+                    cat_gpu_ms = (
+                        cat_start_event.elapsed_time(cat_done_event)
+                        if cat_start_event is not None
+                        and cat_done_event is not None
+                        else 0.0
+                    )
+                    gather_gpu_ms = (
+                        store_start_event.elapsed_time(gather_done_event)
+                        if store_start_event is not None
+                        and gather_done_event is not None
+                        else 0.0
+                    )
+                    tile_gpu_ms = (
+                        store_start_event.elapsed_time(ready_event)
+                        if store_start_event is not None
+                        else 0.0
+                    )
+                    logger.info(
+                        "[pd-request-batch-timing] phase=complete first_layer=%d "
+                        "layers=%d requests=%d tokens=%d "
+                        "cat_gpu_ms=%.4f gather_gpu_ms=%.4f d2h_gpu_ms=%.4f "
+                        "tile_gpu_ms=%.4f",
+                        group_start,
+                        group_layers,
+                        len(entries),
+                        total_tokens,
+                        cat_gpu_ms,
+                        gather_gpu_ms,
+                        max(0.0, tile_gpu_ms - gather_gpu_ms),
+                        tile_gpu_ms,
+                    )
+                waited = True
+
+        for entry in entries:
+            entry.waiter.resolve(wait_ready)
+
     def _batched_from_gpu_grouped_layers(
         self,
         *,
@@ -2280,13 +2761,15 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         reservation: _GPUBufferReservation,
         dependency_claim: Optional[Callable[[int, int], bool]],
         group_size: int,
+        request_batch: Optional[LayerwiseRequestBatch],
+        req_id: Optional[str],
     ):
         """Offload small layer groups while preserving forward overlap."""
 
         assert self.kvcaches is not None
         assert self.kv_cache_pointers_on_gpu is not None
         current_stream = torch.cuda.current_stream()
-        offload_handles: list[LayerwiseOffloadHandle] = []
+        completion_handles: list[LayerwiseOffloadHandle] = []
 
         def group_waiter(ready_event: torch.cuda.Event) -> Callable[[], None]:
             wait_lock = threading.Lock()
@@ -2309,6 +2792,24 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 self.num_layers,
             )
             group_layers = group_end - group_start
+            if request_batch is not None:
+                entry = _LayerwiseRequestBatchEntry(
+                    group_start=group_start,
+                    group_end=group_end,
+                    memory_objs=memory_objs,
+                    slot_mapping=slot_mapping,
+                    req_id=req_id,
+                )
+                request_batch.register(entry)
+                for layer_id in range(group_start, group_end):
+                    offload_handle = LayerwiseOffloadHandle(
+                        layer_id,
+                        entry.waiter.wait,
+                        request_batch,
+                    )
+                    yield offload_handle
+                continue
+
             store_stream_id, store_stream = self._select_layerwise_store_stream(
                 group_start // group_size
             )
@@ -2382,10 +2883,13 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 if self.use_mla:
                     memory_objs[layer_id][0].metadata.fmt = MemoryFormat.KV_MLA_FMT
                 offload_handle = LayerwiseOffloadHandle(layer_id, wait_ready)
-                offload_handles.append(offload_handle)
+                if layer_id == group_start:
+                    completion_handles.append(offload_handle)
                 yield offload_handle
 
-        for offload_handle in offload_handles:
+        # Shared request batches are already synchronized by LayerwiseStoreBatch;
+        # only standalone grouped transfers reach this final wait.
+        for offload_handle in completion_handles:
             offload_handle.wait()
 
         reservation.release(synchronize=False)
@@ -2398,31 +2902,16 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         slot_mapping: torch.Tensor,
         tmp_gpu_buffer_tensors: list[torch.Tensor],
         reservation: _GPUBufferReservation,
-        req_id: Optional[str],
         dependency_claim: Optional[Callable[[int, int], bool]],
         contiguous_pinned_d2h: bool,
     ):
-        """Enqueue one gather and D2H per layer without diagnostic bookkeeping."""
+        """Enqueue one gather and D2H per layer."""
 
         assert self.kvcaches is not None
         current_stream = torch.cuda.current_stream()
         offload_handles: list[LayerwiseOffloadHandle] = []
-        profile_submits = os.getenv("PD_BACKEND_FAST_D2H_SUBMIT_TIMING") == "1"
-        select_time = 0.0
-        event_create_time = 0.0
-        stream_switch_time = 0.0
-        wait_stream_time = 0.0
-        gather_submit_time = 0.0
-        copy_submit_time = 0.0
-        event_record_time = 0.0
-        other_time = 0.0
-        layer_submit_times: list[float] = []
-        wait_stream_calls = 0
-        wait_stream_skips = 0
 
         for layer_id in range(self.num_layers):
-            layer_start = time.perf_counter() if profile_submits else 0.0
-            select_start = time.perf_counter() if profile_submits else 0.0
             store_stream_id, store_stream = self._select_layerwise_store_stream(
                 layer_id
             )
@@ -2439,18 +2928,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             )
             destination = None if raw_destination is not None else memory_obj.tensor
             assert raw_destination is not None or destination is not None
-            if profile_submits:
-                select_time += time.perf_counter() - select_start
-                event_create_start = time.perf_counter()
             ready_event = torch.cuda.Event()
-            if profile_submits:
-                event_create_time += time.perf_counter() - event_create_start
-                stream_switch_start = time.perf_counter()
             torch.cuda.set_stream(store_stream)
-            if profile_submits:
-                stream_switch_time += time.perf_counter() - stream_switch_start
             try:
-                wait_stream_start = time.perf_counter() if profile_submits else 0.0
                 # Layer 0 also includes a request-local asynchronous slot-mapping
                 # copy, so every request must wait there. On later layers, all
                 # requests in one scheduler step consume the same completed model
@@ -2463,12 +2943,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 )
                 if should_wait:
                     store_stream.wait_stream(current_stream)
-                    wait_stream_calls += 1
-                else:
-                    wait_stream_skips += 1
-                if profile_submits:
-                    wait_stream_time += time.perf_counter() - wait_stream_start
-                    gather_start = time.perf_counter()
                 lmc_ops.single_layer_kv_transfer(
                     gpu_buffer,
                     self.kvcaches[layer_id],
@@ -2477,9 +2951,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                     self.gpu_kv_format,
                     token_major=True,
                 )
-                if profile_submits:
-                    gather_submit_time += time.perf_counter() - gather_start
-                    copy_start = time.perf_counter()
                 if raw_destination is not None:
                     # The PD TCP allocator owns one contiguous pinned allocation.
                     # Submit the D2H directly by address to avoid constructing a
@@ -2495,26 +2966,9 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 else:
                     assert destination is not None
                     destination.copy_(gpu_buffer, non_blocking=True)
-                if profile_submits:
-                    copy_submit_time += time.perf_counter() - copy_start
-                    record_start = time.perf_counter()
                 ready_event.record(store_stream)
-                if profile_submits:
-                    event_record_time += time.perf_counter() - record_start
             finally:
-                restore_stream_start = (
-                    time.perf_counter() if profile_submits else 0.0
-                )
                 torch.cuda.set_stream(current_stream)
-                if profile_submits:
-                    stream_switch_time += (
-                        time.perf_counter() - restore_stream_start
-                    )
-
-            if profile_submits:
-                layer_end = time.perf_counter()
-                layer_elapsed = layer_end - layer_start
-                layer_submit_times.append(layer_elapsed)
 
             if self.use_mla:
                 memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
@@ -2525,47 +2979,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             )
             offload_handles.append(offload_handle)
             yield offload_handle
-
-        if profile_submits:
-            measured_time = (
-                select_time
-                + event_create_time
-                + stream_switch_time
-                + wait_stream_time
-                + gather_submit_time
-                + copy_submit_time
-                + event_record_time
-            )
-            total_submit_time = sum(layer_submit_times)
-            other_time = max(0.0, total_submit_time - measured_time)
-            sorted_layer_times = sorted(layer_submit_times)
-            p50 = statistics.median(sorted_layer_times)
-            p95 = sorted_layer_times[int(0.95 * (len(sorted_layer_times) - 1))]
-            logger.info(
-                "[req_id=%s] Layerwise fast D2H submit breakdown: layers=%d "
-                "total_ms=%.4f select_ms=%.4f event_create_ms=%.4f "
-                "stream_switch_ms=%.4f wait_stream_ms=%.4f "
-                "gather_submit_ms=%.4f copy_submit_ms=%.4f "
-                "event_record_ms=%.4f other_ms=%.4f "
-                "wait_stream_calls=%d wait_stream_skips=%d "
-                "layer_p50_ms=%.4f layer_p95_ms=%.4f layer_max_ms=%.4f",
-                req_id,
-                self.num_layers,
-                total_submit_time * 1000,
-                select_time * 1000,
-                event_create_time * 1000,
-                stream_switch_time * 1000,
-                wait_stream_time * 1000,
-                gather_submit_time * 1000,
-                copy_submit_time * 1000,
-                event_record_time * 1000,
-                other_time * 1000,
-                wait_stream_calls,
-                wait_stream_skips,
-                p50 * 1000,
-                p95 * 1000,
-                max(layer_submit_times) * 1000,
-            )
 
         for offload_handle in offload_handles:
             offload_handle.wait()

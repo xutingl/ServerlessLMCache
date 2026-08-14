@@ -48,6 +48,7 @@ from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import (
     GPUConnectorInterface,
     LayerwiseOffloadHandle,
+    LayerwiseRequestBatch,
 )
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import CuFileMemoryAllocator  # noqa: E501
@@ -142,6 +143,135 @@ def _transfer_spec_with_chunk_ids(
 
 class CacheEngineEndSignal:
     pass
+
+
+class _LayerwiseStoreBatchTask:
+    """One request's put work for a shared layer tile."""
+
+    def __init__(
+        self,
+        wait_ready: Callable[[], None],
+        put: Callable[[], None],
+        abort: Callable[[], None],
+    ) -> None:
+        self.wait_ready = wait_ready
+        self.put = put
+        self.abort = abort
+
+
+class LayerwiseStoreBatch:
+    """Submit one cache-engine task for a layer tile spanning requests."""
+
+    def __init__(
+        self,
+        gpu_batch: LayerwiseRequestBatch,
+        executor: ThreadPoolExecutor,
+    ) -> None:
+        self.gpu_batch = gpu_batch
+        self.group_size = gpu_batch.group_size
+        self._executor = executor
+        self._lock = threading.Lock()
+        self._pending: list[_LayerwiseStoreBatchTask] = []
+        self._pending_completion: Future[None] = Future()
+        self._error: Optional[BaseException] = None
+
+    def register_put_task(self, task: _LayerwiseStoreBatchTask) -> Future[None]:
+        with self._lock:
+            if self._error is not None:
+                raise RuntimeError("layerwise store batch is aborted") from self._error
+            self._pending.append(task)
+            return self._pending_completion
+
+    @staticmethod
+    def _abort_tasks(tasks: list[_LayerwiseStoreBatchTask]) -> None:
+        if not tasks:
+            return
+        try:
+            tasks[0].wait_ready()
+        except BaseException:
+            pass
+        for task in tasks:
+            try:
+                task.abort()
+            except BaseException:
+                logger.exception("Failed to clean up an aborted layerwise batch task")
+
+    @staticmethod
+    def _run_tasks(tasks: list[_LayerwiseStoreBatchTask]) -> None:
+        try:
+            # Every task in this tile resolves to the same shared D2H event.
+            tasks[0].wait_ready()
+        except BaseException:
+            LayerwiseStoreBatch._abort_tasks(tasks)
+            raise
+
+        first_error: Optional[BaseException] = None
+        for task in tasks:
+            try:
+                task.put()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    @staticmethod
+    def _resolve_completion(
+        submitted: Future[None],
+        completion: Future[None],
+    ) -> None:
+        try:
+            submitted.result()
+        except BaseException as exc:
+            completion.set_exception(exc)
+        else:
+            completion.set_result(None)
+
+    def flush(self) -> int:
+        with self._lock:
+            tasks = self._pending
+            completion = self._pending_completion
+            self._pending = []
+            self._pending_completion = Future()
+            error = self._error
+
+        if error is not None:
+            raise RuntimeError("layerwise store batch is aborted") from error
+
+        try:
+            entry_count = self.gpu_batch.flush()
+            if entry_count != len(tasks):
+                raise RuntimeError(
+                    "layerwise store batch registration mismatch: "
+                    f"gpu_entries={entry_count}, put_tasks={len(tasks)}"
+                )
+            if not tasks:
+                completion.set_result(None)
+                return 0
+            submitted = self._executor.submit(self._run_tasks, tasks)
+        except BaseException as exc:
+            self.gpu_batch.abort(exc)
+            self._abort_tasks(tasks)
+            completion.set_exception(exc)
+            raise
+
+        submitted.add_done_callback(
+            lambda done: self._resolve_completion(done, completion)
+        )
+        return entry_count
+
+    def abort(self, error: BaseException) -> None:
+        with self._lock:
+            if self._error is None:
+                self._error = error
+            tasks = self._pending
+            completion = self._pending_completion
+            self._pending = []
+            self._pending_completion = Future()
+        self.gpu_batch.abort(error)
+        self._abort_tasks(tasks)
+        if tasks and not completion.done():
+            completion.set_exception(error)
 
 
 class LMCacheEngine:
@@ -699,6 +829,27 @@ class LMCacheEngine:
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
+    def create_layerwise_store_batch(self, total_tokens: int) -> LayerwiseStoreBatch:
+        """Create a layer-major GPU and put batch for one scheduler forward."""
+
+        if self.gpu_connector is None or self._layerwise_put_executor is None:
+            raise RuntimeError("layerwise store batching requires a layerwise engine")
+        create_gpu_batch = getattr(
+            self.gpu_connector,
+            "create_layerwise_request_batch",
+            None,
+        )
+        if not callable(create_gpu_batch):
+            raise RuntimeError(
+                "GPU connector does not support layerwise request batches"
+            )
+        return LayerwiseStoreBatch(
+            create_gpu_batch(total_tokens),
+            self._layerwise_put_executor,
+        )
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
     def store_layer(
         self,
         tokens: Union[torch.Tensor, list[int]],
@@ -872,6 +1023,9 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
         fuse_layerwise_offload = bool(kwargs.get("fuse_layerwise_offload", False))
+        layerwise_store_batch = kwargs.get("layerwise_request_batch")
+        if isinstance(layerwise_store_batch, LayerwiseStoreBatch):
+            kwargs["layerwise_request_batch"] = layerwise_store_batch.gpu_batch
 
         store_timeline_enabled = (
             os.environ.get("PD_BACKEND_LAYER_TIMING") == "1"
@@ -1145,16 +1299,16 @@ class LMCacheEngine:
             pending_layer_puts: list[tuple[int, LayerwiseOffloadHandle]] = []
             put_stats_lock = threading.Lock()
 
-            def submit_layer_puts(
+            def build_layer_put_task(
                 entries: list[tuple[int, LayerwiseOffloadHandle, Any]],
-            ) -> None:
+                *,
+                shared_request_batch: bool,
+            ) -> _LayerwiseStoreBatchTask:
                 nonlocal io_time
                 nonlocal put_submit_time
                 nonlocal put_ready_wait_time
                 nonlocal put_task_wall_time
                 nonlocal block_lease_release_time
-                executor = self._layerwise_put_executor
-                assert executor is not None
                 assert entries
 
                 batch_keys = [
@@ -1170,39 +1324,43 @@ class LMCacheEngine:
                     chunk_ids * len(entries),
                 )
 
-                def wait_and_put() -> None:
-                    nonlocal io_time
-                    nonlocal put_submit_time
+                cleanup_lock = threading.Lock()
+                cleaned = False
+
+                def wait_ready() -> None:
                     nonlocal put_ready_wait_time
-                    nonlocal put_task_wall_time
-                    nonlocal block_lease_release_time
-                    task_start = time.perf_counter()
                     wait_start = time.perf_counter()
-                    lease_release_elapsed = 0.0
                     first_wait_error: Optional[BaseException] = None
-                    # The connector may fall back to independent per-layer D2H
-                    # handles when a contiguous fused destination is unavailable.
-                    # Waiting every handle is therefore required for correctness;
-                    # fused handles share one event, so repeats are already-ready.
-                    for _, offload_handle, _ in entries:
+                    # One request-batch tile has one shared D2H event. Fallback
+                    # paths retain independent per-layer handles and wait all.
+                    ready_entries = entries[:1] if shared_request_batch else entries
+                    for _, offload_handle, _ in ready_entries:
                         try:
                             offload_handle.wait()
                         except BaseException as exc:
                             if first_wait_error is None:
                                 first_wait_error = exc
                     wait_end = time.perf_counter()
+                    ready_wait_elapsed = wait_end - wait_start
+
+                    with put_stats_lock:
+                        put_ready_wait_time += ready_wait_elapsed
+                    if first_wait_error is not None:
+                        raise first_wait_error
+
+                def put() -> None:
+                    nonlocal io_time
+                    nonlocal put_submit_time
+                    nonlocal put_task_wall_time
+                    nonlocal block_lease_release_time
+                    task_start = time.perf_counter()
+                    lease_release_elapsed = 0.0
                     for layer_id, _, block_lease in entries:
                         lease_release_elapsed += close_block_lease(
                             block_lease,
                             layer_id,
                             "d2h_done",
                         )
-                    ready_wait_elapsed = wait_end - wait_start
-
-                    if first_wait_error is not None:
-                        for memory_obj in batch_memory_objs:
-                            memory_obj.ref_count_down()
-                        raise first_wait_error
 
                     put_start = time.perf_counter()
                     self.storage_manager.batched_put(
@@ -1215,7 +1373,6 @@ class LMCacheEngine:
                     put_elapsed = put_end - put_start
                     task_wall_elapsed = put_end - task_start
                     with put_stats_lock:
-                        put_ready_wait_time += ready_wait_elapsed
                         put_submit_time += put_elapsed
                         io_time += task_wall_elapsed
                         put_task_wall_time += task_wall_elapsed
@@ -1223,34 +1380,81 @@ class LMCacheEngine:
                     if detailed_offload_timing:
                         logger.info(
                             "[req_id=%s] Layerwise async put step: "
-                            "first_layer=%d layers=%d ready_wait_ms=%.4f "
+                            "first_layer=%d layers=%d "
                             "lease_release_ms=%.4f put_submit_ms=%.4f task_ms=%.4f",
                             req_id,
                             entries[0][0],
                             len(entries),
-                            ready_wait_elapsed * 1000,
                             lease_release_elapsed * 1000,
                             put_elapsed * 1000,
                             task_wall_elapsed * 1000,
                         )
 
+                def abort() -> None:
+                    nonlocal cleaned
+                    with cleanup_lock:
+                        if cleaned:
+                            return
+                        cleaned = True
+                    for layer_id, _, block_lease in entries:
+                        close_block_lease(
+                            block_lease,
+                            layer_id,
+                            "put_submit_failed",
+                        )
+                    for memory_obj in batch_memory_objs:
+                        memory_obj.ref_count_down()
+
+                return _LayerwiseStoreBatchTask(wait_ready, put, abort)
+
+            def submit_layer_puts(
+                entries: list[tuple[int, LayerwiseOffloadHandle, Any]],
+            ) -> None:
+                uses_request_batch = (
+                    isinstance(layerwise_store_batch, LayerwiseStoreBatch)
+                    and all(
+                        getattr(handle, "request_batch", None)
+                        is layerwise_store_batch.gpu_batch
+                        for _, handle, _ in entries
+                    )
+                )
+                task = build_layer_put_task(
+                    entries,
+                    shared_request_batch=uses_request_batch,
+                )
+                if uses_request_batch:
+                    try:
+                        future = layerwise_store_batch.register_put_task(task)
+                    except BaseException:
+                        try:
+                            task.wait_ready()
+                        except BaseException:
+                            pass
+                        task.abort()
+                        raise
+                    put_futures.append(future)
+                    return
+
+                executor = self._layerwise_put_executor
+                assert executor is not None
+
+                def wait_and_put() -> None:
+                    try:
+                        task.wait_ready()
+                    except BaseException:
+                        task.abort()
+                        raise
+                    task.put()
+
                 submit_start = time.perf_counter()
                 try:
                     future = executor.submit(wait_and_put)
                 except BaseException:
-                    for layer_id, offload_handle, block_lease in entries:
-                        try:
-                            offload_handle.wait()
-                        except BaseException:
-                            pass
-                        finally:
-                            close_block_lease(
-                                block_lease,
-                                layer_id,
-                                "put_submit_failed",
-                            )
-                    for memory_obj in batch_memory_objs:
-                        memory_obj.ref_count_down()
+                    try:
+                        task.wait_ready()
+                    except BaseException:
+                        pass
+                    task.abort()
                     raise
                 submit_end = time.perf_counter()
                 put_futures.append(future)
