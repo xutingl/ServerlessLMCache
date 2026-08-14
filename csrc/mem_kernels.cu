@@ -306,6 +306,15 @@ key_value_offset(const int k_or_v, const int layer_idx, const int token_idx,
          token_idx * scalars_per_token + scalar_offset;
 }
 
+__device__ __forceinline__ int64_t key_value_offset_token_major(
+    const int k_or_v, const int layer_idx, const int token_idx,
+    const int scalar_offset, const int scalars_per_token,
+    const int num_tokens, const int k_or_v_size) {
+  return ((layer_idx * num_tokens + token_idx) * k_or_v_size + k_or_v) *
+             scalars_per_token +
+         scalar_offset;
+}
+
 template <typename scalar_t>
 __global__ void single_layer_kv_transfer_sgl_kernel(
     // scalar_t* __restrict__ lmc_key_cache,    // [num_tokens,
@@ -363,7 +372,8 @@ __global__ void single_layer_kv_transfer_sgl_kernel(
  * key_value[block.z, block.y, block.x, thread.x] <=> ptrs[block.y][block.z,
  * slot_id, thread.x]
  */
-template <typename scalar_t, bool DIRECTION, GPUKVFormat format>
+template <typename scalar_t, bool DIRECTION, GPUKVFormat format,
+          bool TOKEN_MAJOR>
 __global__ void load_and_reshape_multi_layer_kernel(
     scalar_t* __restrict__ key_value,           // [2, num_layer, num_tokens,
                                                 // scalars_per_token]
@@ -376,8 +386,8 @@ __global__ void load_and_reshape_multi_layer_kernel(
                                                 // scalars_per_token]
     const int64_t* __restrict__ slot_mapping,   // [num_tokens]
     const int scalars_per_token, const int num_tokens, const int num_layers,
-    const int page_buffer_size, const int block_size, const int head_size,
-    const int skip_prefix_n_tokens) {
+    const int k_or_v_size, const int page_buffer_size, const int block_size,
+    const int head_size, const int skip_prefix_n_tokens) {
   const int token_id = blockIdx.x;
   const int layer_id = blockIdx.y;
   const int k_or_v = blockIdx.z;
@@ -395,8 +405,12 @@ __global__ void load_and_reshape_multi_layer_kernel(
   /** Copy the data from page buffer to key_value **/
   for (int i = tid; i < scalars_per_token; i += num_threads) {
     const int64_t lmcache_offset =
-        key_value_offset(k_or_v, layer_id, kv_token_id, i, scalars_per_token,
-                         num_tokens, num_layers);
+        TOKEN_MAJOR
+            ? key_value_offset_token_major(k_or_v, layer_id, kv_token_id, i,
+                                           scalars_per_token, num_tokens,
+                                           k_or_v_size)
+            : key_value_offset(k_or_v, layer_id, kv_token_id, i,
+                               scalars_per_token, num_tokens, num_layers);
 
     const int64_t vllm_offset =
         page_buffer_offset<format>(k_or_v, slot_idx, i, scalars_per_token,
@@ -507,12 +521,14 @@ T* get_kernel_ptr(TENSOR_TYPE& tensor) {
  *  - direction: H2D  means LMCache to PagedBuffer, D2H  means PagedBuffer to
  * LMCache
  */
-#define LAUNCH_KERNEL_WITH_FORMAT(T, DIRECTION, FORMAT)                      \
-  lmc::load_and_reshape_multi_layer_kernel<T, DIRECTION, FORMAT>             \
+#define LAUNCH_KERNEL_WITH_FORMAT(T, DIRECTION, FORMAT, TOKEN_MAJOR)         \
+  lmc::load_and_reshape_multi_layer_kernel<T, DIRECTION, FORMAT,             \
+                                           TOKEN_MAJOR>                      \
       <<<grid, block, 0, stream>>>(key_value_ptr, page_buffer_ptrs,          \
                                    slot_mapping_ptr, num_xwords, num_tokens, \
-                                   num_layers, page_buffer_size, block_size, \
-                                   head_size_xword, skip_prefix_n_tokens);   \
+                                   num_layers, k_or_v_size, page_buffer_size,\
+                                   block_size, head_size_xword,              \
+                                   skip_prefix_n_tokens);                    \
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
 template <typename T>
@@ -527,15 +543,16 @@ void multi_layer_kv_transfer_templated(
     const torch::Tensor& slot_mapping,    // [num_tokens],
     const torch::Device& paged_memory_device, const int page_buffer_size,
     const TransferDirection direction, const GPUKVFormat gpu_kv_format,
-    const int block_size, const int head_size, const int skip_prefix_n_tokens) {
+    const int block_size, const int head_size, const int skip_prefix_n_tokens,
+    const bool token_major) {
   T* key_value_ptr = get_kernel_ptr<T, torch::Tensor>(key_value);
   T** page_buffer_ptrs =
       get_kernel_ptr<T*, const torch::Tensor>(key_value_ptrs);
   const int64_t* slot_mapping_ptr =
       get_kernel_ptr<const int64_t, const torch::Tensor>(slot_mapping);
 
-  int num_layers = key_value.size(1);
-  int num_tokens = key_value.size(2);
+  int num_layers = token_major ? key_value.size(0) : key_value.size(1);
+  int num_tokens = token_major ? key_value.size(1) : key_value.size(2);
   int num_transfer_tokens = num_tokens - skip_prefix_n_tokens;
   int num_origin_elements = key_value.size(3);
   int elements_per_xword = sizeof(T) / key_value.element_size();
@@ -559,25 +576,67 @@ void multi_layer_kv_transfer_templated(
   if (direction == TransferDirection::H2D) {
     switch (gpu_kv_format) {
       case GPUKVFormat::NB_NL_TWO_BS_NH_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NB_NL_TWO_BS_NH_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NB_NL_TWO_BS_NH_HS,
+                                    true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NB_NL_TWO_BS_NH_HS,
+                                    false);
+        }
         break;
       case GPUKVFormat::NL_X_TWO_NB_BS_NH_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_TWO_NB_BS_NH_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false,
+                                    GPUKVFormat::NL_X_TWO_NB_BS_NH_HS, true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false,
+                                    GPUKVFormat::NL_X_TWO_NB_BS_NH_HS, false);
+        }
         break;
       case GPUKVFormat::NL_X_NB_TWO_BS_NH_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NB_TWO_BS_NH_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false,
+                                    GPUKVFormat::NL_X_NB_TWO_BS_NH_HS, true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false,
+                                    GPUKVFormat::NL_X_NB_TWO_BS_NH_HS, false);
+        }
         break;
       case GPUKVFormat::NL_X_NB_BS_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NB_BS_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NB_BS_HS,
+                                    true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NB_BS_HS,
+                                    false);
+        }
         break;
       case GPUKVFormat::NL_X_NBBS_ONE_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NBBS_ONE_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NBBS_ONE_HS,
+                                    true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NBBS_ONE_HS,
+                                    false);
+        }
         break;
       case GPUKVFormat::NL_X_TWO_NB_NH_BS_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_TWO_NB_NH_BS_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false,
+                                    GPUKVFormat::NL_X_TWO_NB_NH_BS_HS, true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false,
+                                    GPUKVFormat::NL_X_TWO_NB_NH_BS_HS, false);
+        }
         break;
       case GPUKVFormat::NL_X_NB_TWO_NH_BS_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, false, GPUKVFormat::NL_X_NB_TWO_NH_BS_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false,
+                                    GPUKVFormat::NL_X_NB_TWO_NH_BS_HS, true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, false,
+                                    GPUKVFormat::NL_X_NB_TWO_NH_BS_HS, false);
+        }
         break;
       default:
         throw std::runtime_error("Unsupported GPUKVFormat");
@@ -585,25 +644,67 @@ void multi_layer_kv_transfer_templated(
   } else {
     switch (gpu_kv_format) {
       case GPUKVFormat::NB_NL_TWO_BS_NH_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NB_NL_TWO_BS_NH_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NB_NL_TWO_BS_NH_HS,
+                                    true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NB_NL_TWO_BS_NH_HS,
+                                    false);
+        }
         break;
       case GPUKVFormat::NL_X_TWO_NB_BS_NH_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_TWO_NB_BS_NH_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true,
+                                    GPUKVFormat::NL_X_TWO_NB_BS_NH_HS, true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true,
+                                    GPUKVFormat::NL_X_TWO_NB_BS_NH_HS, false);
+        }
         break;
       case GPUKVFormat::NL_X_NB_TWO_BS_NH_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NB_TWO_BS_NH_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true,
+                                    GPUKVFormat::NL_X_NB_TWO_BS_NH_HS, true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true,
+                                    GPUKVFormat::NL_X_NB_TWO_BS_NH_HS, false);
+        }
         break;
       case GPUKVFormat::NL_X_NB_BS_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NB_BS_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NB_BS_HS,
+                                    true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NB_BS_HS,
+                                    false);
+        }
         break;
       case GPUKVFormat::NL_X_NBBS_ONE_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NBBS_ONE_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NBBS_ONE_HS,
+                                    true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NBBS_ONE_HS,
+                                    false);
+        }
         break;
       case GPUKVFormat::NL_X_TWO_NB_NH_BS_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_TWO_NB_NH_BS_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true,
+                                    GPUKVFormat::NL_X_TWO_NB_NH_BS_HS, true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true,
+                                    GPUKVFormat::NL_X_TWO_NB_NH_BS_HS, false);
+        }
         break;
       case GPUKVFormat::NL_X_NB_TWO_NH_BS_HS:
-        LAUNCH_KERNEL_WITH_FORMAT(T, true, GPUKVFormat::NL_X_NB_TWO_NH_BS_HS);
+        if (token_major) {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true,
+                                    GPUKVFormat::NL_X_NB_TWO_NH_BS_HS, true);
+        } else {
+          LAUNCH_KERNEL_WITH_FORMAT(T, true,
+                                    GPUKVFormat::NL_X_NB_TWO_NH_BS_HS, false);
+        }
         break;
       default:
         throw std::runtime_error("Unsupported GPUKVFormat");
@@ -630,7 +731,7 @@ void multi_layer_kv_transfer(
       multi_layer_kv_transfer_templated<type>(                               \
           key_value, key_value_ptrs, slot_mapping, paged_memory_device,      \
           page_buffer_size, direction, gpu_kv_format, block_size, head_size, \
-          skip_prefix_n_tokens);                                             \
+          skip_prefix_n_tokens, false);                                      \
     } while (0)
 #endif
   if (copy_size % 8 == 0) {
@@ -643,6 +744,35 @@ void multi_layer_kv_transfer(
     LAUNCH_MULTI_LAYER_KV_TRANSFER(int8_t);
   }
 #undef LAUNCH_MULTI_LAYER_KV_TRANSFER
+}
+
+void multi_layer_kv_transfer_token_major(
+    torch::Tensor& key_value, const torch::Tensor& key_value_ptrs,
+    const torch::Tensor& slot_mapping, const torch::Device& paged_memory_device,
+    const int page_buffer_size, const TransferDirection direction,
+    const GPUKVFormat gpu_kv_format, const int block_size, const int head_size,
+    const int skip_prefix_n_tokens) {
+  int num_origin_elements = key_value.size(3);
+  int copy_size = num_origin_elements * key_value.element_size();
+#ifndef LAUNCH_MULTI_LAYER_KV_TRANSFER_TOKEN_MAJOR
+  #define LAUNCH_MULTI_LAYER_KV_TRANSFER_TOKEN_MAJOR(type)                   \
+    do {                                                                     \
+      multi_layer_kv_transfer_templated<type>(                               \
+          key_value, key_value_ptrs, slot_mapping, paged_memory_device,      \
+          page_buffer_size, direction, gpu_kv_format, block_size, head_size, \
+          skip_prefix_n_tokens, true);                                       \
+    } while (0)
+#endif
+  if (copy_size % 8 == 0) {
+    LAUNCH_MULTI_LAYER_KV_TRANSFER_TOKEN_MAJOR(int64_t);
+  } else if (copy_size % 4 == 0) {
+    LAUNCH_MULTI_LAYER_KV_TRANSFER_TOKEN_MAJOR(int32_t);
+  } else if (copy_size % 2 == 0) {
+    LAUNCH_MULTI_LAYER_KV_TRANSFER_TOKEN_MAJOR(int16_t);
+  } else {
+    LAUNCH_MULTI_LAYER_KV_TRANSFER_TOKEN_MAJOR(int8_t);
+  }
+#undef LAUNCH_MULTI_LAYER_KV_TRANSFER_TOKEN_MAJOR
 }
 
 /**

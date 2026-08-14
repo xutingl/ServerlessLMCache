@@ -136,7 +136,7 @@ def _transfer_spec_with_chunk_ids(
     if transfer_spec is None:
         return None
     cloned_spec = copy.copy(transfer_spec)
-    setattr(cloned_spec, "chunk_ids", list(chunk_ids))
+    cloned_spec.chunk_ids = list(chunk_ids)
     return cloned_spec
 
 
@@ -717,10 +717,9 @@ class LMCacheEngine:
         :param **kwargs: The additional arguments for the storage backend which
             will be passed into the gpu_connector.
 
-        return: A generator that yields once per logical layer while the GPU
-            connector enqueues offload work. Backend puts begin after all layer
-            hooks have run; connectors may preserve per-layer transfers or fuse
-            them into one physical transfer.
+        return: A generator that yields as the GPU connector enqueues offload
+            work. Layer groups may be submitted to storage as soon as their D2H
+            completes, while fused saves retain one full-request transfer.
         """
         layerwise_block_leases = kwargs.pop("layerwise_block_leases", None)
         req_id = self._get_req_id(kwargs)
@@ -987,20 +986,48 @@ class LMCacheEngine:
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
             keys = [list(row) for row in zip(*keys, strict=False)]
-            fused_batch_keys = (
-                [key for layer_keys in keys for key in layer_keys]
-                if fuse_layerwise_offload
-                else []
+            batch_layerwise_puts = bool(kwargs.get("batch_layerwise_puts", False))
+            yield_group_size = max(
+                1,
+                min(
+                    self.num_layers,
+                    int(kwargs.get("layerwise_yield_group_size", 1)),
+                ),
             )
-            fused_batch_memory_objs = (
+            put_group_size = (
+                self.num_layers
+                if fuse_layerwise_offload
+                else yield_group_size
+                if batch_layerwise_puts
+                else 1
+            )
+            put_layer_groups = [
+                list(
+                    range(
+                        group_start,
+                        min(group_start + put_group_size, self.num_layers),
+                    )
+                )
+                for group_start in range(0, self.num_layers, put_group_size)
+            ]
+            all_layer_batch_keys = [key for layer_keys in keys for key in layer_keys]
+            all_layer_batch_memory_objs = [
+                memory_obj
+                for layer_memory_objs in memory_objs
+                for memory_obj in layer_memory_objs
+            ]
+            put_group_keys = [
+                [key for layer_id in layer_ids for key in keys[layer_id]]
+                for layer_ids in put_layer_groups
+            ]
+            put_group_memory_objs = [
                 [
                     memory_obj
-                    for layer_memory_objs in memory_objs
-                    for memory_obj in layer_memory_objs
+                    for layer_id in layer_ids
+                    for memory_obj in memory_objs[layer_id]
                 ]
-                if fuse_layerwise_offload
-                else []
-            )
+                for layer_ids in put_layer_groups
+            ]
 
             # Calculate total KV size for logging
             tot_kv_size = sum(
@@ -1032,13 +1059,16 @@ class LMCacheEngine:
                 chunk_size=self.config.chunk_size,
                 chunk_lengths=save_chunk_lengths,
             )
+            base_transfer_spec = kwargs.get("transfer_spec")
             transfer_spec = _transfer_spec_with_chunk_ids(
-                kwargs.get("transfer_spec"),
-                chunk_ids * len(keys) if fuse_layerwise_offload else chunk_ids,
+                base_transfer_spec,
+                chunk_ids * len(keys),
             )
             if transfer_spec is not None:
                 remote_prepare_start = time.perf_counter()
-                for backend_name, backend in self.storage_manager.storage_backends.items():
+                for backend_name, backend in (
+                    self.storage_manager.storage_backends.items()
+                ):
                     if self.store_location and backend_name != self.store_location:
                         continue
                     prepare_put = getattr(backend, "prepare_batched_put_task", None)
@@ -1046,31 +1076,37 @@ class LMCacheEngine:
                         continue
                     if fuse_layerwise_offload:
                         prepare_put(
-                            fused_batch_keys,
-                            fused_batch_memory_objs,
+                            all_layer_batch_keys,
+                            all_layer_batch_memory_objs,
                             transfer_spec=transfer_spec,
                         )
                         remote_prepare_layers += len(keys)
                         continue
-                    prepare_layerwise = getattr(
+                    prepare_grouped = getattr(
                         backend, "prepare_layerwise_put_tasks", None
                     )
-                    if callable(prepare_layerwise) and prepare_layerwise(
-                        keys,
-                        memory_objs,
+                    if callable(prepare_grouped) and prepare_grouped(
+                        put_group_keys,
+                        put_group_memory_objs,
                         transfer_spec=transfer_spec,
                     ):
                         remote_prepare_layers += len(keys)
                         continue
-                    for layer_keys, layer_memory_objs in zip(
-                        keys, memory_objs, strict=False
+                    for layer_ids, group_keys, group_memory_objs in zip(
+                        put_layer_groups,
+                        put_group_keys,
+                        put_group_memory_objs,
+                        strict=True,
                     ):
                         prepare_put(
-                            layer_keys,
-                            layer_memory_objs,
-                            transfer_spec=transfer_spec,
+                            group_keys,
+                            group_memory_objs,
+                            transfer_spec=_transfer_spec_with_chunk_ids(
+                                base_transfer_spec,
+                                chunk_ids * len(layer_ids),
+                            ),
                         )
-                        remote_prepare_layers += 1
+                        remote_prepare_layers += len(layer_ids)
                 remote_prepare_end = time.perf_counter()
                 remote_prepare_submit_time = (
                     remote_prepare_end - remote_prepare_start
@@ -1121,18 +1157,18 @@ class LMCacheEngine:
                 assert executor is not None
                 assert entries
 
-                if fuse_layerwise_offload:
-                    batch_keys = fused_batch_keys
-                    batch_memory_objs = fused_batch_memory_objs
-                else:
-                    batch_keys = [
-                        key for layer_id, _, _ in entries for key in keys[layer_id]
-                    ]
-                    batch_memory_objs = [
-                        memory_obj
-                        for layer_id, _, _ in entries
-                        for memory_obj in memory_objs[layer_id]
-                    ]
+                batch_keys = [
+                    key for layer_id, _, _ in entries for key in keys[layer_id]
+                ]
+                batch_memory_objs = [
+                    memory_obj
+                    for layer_id, _, _ in entries
+                    for memory_obj in memory_objs[layer_id]
+                ]
+                put_transfer_spec = _transfer_spec_with_chunk_ids(
+                    base_transfer_spec,
+                    chunk_ids * len(entries),
+                )
 
                 def wait_and_put() -> None:
                     nonlocal io_time
@@ -1172,7 +1208,7 @@ class LMCacheEngine:
                     self.storage_manager.batched_put(
                         batch_keys,
                         batch_memory_objs,
-                        transfer_spec=transfer_spec,
+                        transfer_spec=put_transfer_spec,
                         location=self.store_location,
                     )
                     put_end = time.perf_counter()
@@ -1248,26 +1284,18 @@ class LMCacheEngine:
                 )
 
             if isinstance(first_offload_handle, LayerwiseOffloadHandle):
-                if getattr(first_offload_handle, "layer_id", 0) != 0:
-                    raise RuntimeError(
-                        "Layerwise offload handle order mismatch: "
-                        f"expected layer 0, got {first_offload_handle.layer_id}"
-                    )
-                pending_layer_puts.append((0, first_offload_handle))
+                offload_handle = first_offload_handle
+                for layer_id in range(self.num_layers):
+                    if layer_id > 0:
+                        offload_start = time.perf_counter()
+                        offload_handle = next(mem_obj_generator)
+                        offload_end = time.perf_counter()
+                        offload_elapsed = offload_end - offload_start
+                        gpu_offload_step_time += offload_elapsed
+                        layer_connector_next_time += offload_elapsed
+                    else:
+                        offload_elapsed = gpu_offload_step_time
 
-                for layer_id in range(1, self.num_layers):
-                    yield_start = time.perf_counter()
-                    yield
-                    yield_end = time.perf_counter()
-                    yield_elapsed = yield_end - yield_start
-                    yield_resume_time += yield_elapsed
-
-                    offload_start = time.perf_counter()
-                    offload_handle = next(mem_obj_generator)
-                    offload_end = time.perf_counter()
-                    offload_elapsed = offload_end - offload_start
-                    gpu_offload_step_time += offload_elapsed
-                    layer_connector_next_time += offload_elapsed
                     if (
                         not isinstance(offload_handle, LayerwiseOffloadHandle)
                         or getattr(offload_handle, "layer_id", None) != layer_id
@@ -1278,8 +1306,6 @@ class LMCacheEngine:
                             f"got {getattr(offload_handle, 'layer_id', None)}"
                         )
                     pending_layer_puts.append((layer_id, offload_handle))
-                    layer_end = time.perf_counter()
-                    layer_step_time += layer_end - yield_end
                     if detailed_offload_timing:
                         logger.info(
                             "[req_id=%s] Layerwise offload step: "
@@ -1288,50 +1314,36 @@ class LMCacheEngine:
                             layer_id,
                             offload_elapsed * 1000,
                         )
-                    log_store_timeline(
-                        "layer_enqueue_step",
-                        yield_start,
-                        layer_end,
-                        layer_id=layer_id,
-                        extra=(
-                            f"yield_wait_ms={yield_elapsed * 1000:.4f} "
-                            f"connector_next_ms={offload_elapsed * 1000:.4f} "
-                            f"active_ms={(layer_end - yield_end) * 1000:.4f}"
-                        ),
+
+                    put_group_complete = (
+                        (layer_id + 1) % put_group_size == 0
+                        or layer_id == self.num_layers - 1
                     )
-
-                final_yield_start = time.perf_counter()
-                yield
-                final_yield_end = time.perf_counter()
-                yield_resume_time += final_yield_end - final_yield_start
-
-                # Starting a worker-side CUDA event wait while the model thread
-                # is still launching later layers serializes CUDA driver work in
-                # practice. Start backend puts only after the forward has
-                # submitted all GPU work; the fused path uses one batch while the
-                # normal path retains one put per layer.
-                if fuse_layerwise_offload:
-                    submit_layer_puts(
-                        [
+                    if put_group_complete:
+                        group_entries = [
                             (
-                                layer_id,
-                                offload_handle,
-                                pop_block_lease(layer_id),
+                                pending_layer_id,
+                                pending_offload_handle,
+                                pop_block_lease(pending_layer_id),
                             )
-                            for layer_id, offload_handle in pending_layer_puts
+                            for pending_layer_id, pending_offload_handle in (
+                                pending_layer_puts
+                            )
                         ]
+                        pending_layer_puts.clear()
+                        submit_layer_puts(group_entries)
+
+                    yield_group_complete = (
+                        (layer_id + 1) % yield_group_size == 0
+                        or layer_id == self.num_layers - 1
                     )
-                else:
-                    for layer_id, offload_handle in pending_layer_puts:
-                        submit_layer_puts(
-                            [
-                                (
-                                    layer_id,
-                                    offload_handle,
-                                    pop_block_lease(layer_id),
-                                )
-                            ]
-                        )
+                    if yield_group_complete:
+                        yield_start = time.perf_counter()
+                        yield
+                        yield_end = time.perf_counter()
+                        yield_resume_time += yield_end - yield_start
+
+                assert not pending_layer_puts
 
                 first_error: Optional[Exception] = None
                 future_wait_start = time.perf_counter()
@@ -1394,7 +1406,10 @@ class LMCacheEngine:
                     self.storage_manager.batched_put(
                         keys[layer_id],
                         memory_objs[layer_id],
-                        transfer_spec=transfer_spec,
+                        transfer_spec=_transfer_spec_with_chunk_ids(
+                            base_transfer_spec,
+                            chunk_ids,
+                        ),
                         location=self.store_location,
                     )
                     put_end = time.perf_counter()

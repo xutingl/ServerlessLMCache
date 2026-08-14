@@ -94,6 +94,13 @@ void multi_layer_kv_transfer(
     const GPUKVFormat gpu_kv_format, const int block_size = 0,
     const int head_size = 0, const int skip_prefix_n_tokens = 0);
 
+void multi_layer_kv_transfer_token_major(
+    torch::Tensor& key_value, const torch::Tensor& key_value_ptrs,
+    const torch::Tensor& slot_mapping, const torch::Device& paged_memory_device,
+    const int page_buffer_size, const TransferDirection direction,
+    const GPUKVFormat gpu_kv_format, const int block_size = 0,
+    const int head_size = 0, const int skip_prefix_n_tokens = 0);
+
 // collapses to multi_layer_kv_transfer for MLA
 void multi_layer_kv_transfer_unilateral(
     torch::Tensor& key_value, const torch::Tensor& key_value_ptrs,
