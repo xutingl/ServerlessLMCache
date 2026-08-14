@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import nullcontext
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 import random
 import threading
 
@@ -115,10 +116,41 @@ def test_layerwise_store_generator_close_drains_before_reuse():
     assert operations == ["sync:store", "sync:copy", "release"]
 
 
+def test_layerwise_request_batch_defers_slot_mapping_concat():
+    connector = object.__new__(VLLMPagedMemLayerwiseGPUConnector)
+    connector.num_layers = 2
+    connector.device = "cuda"
+    connector.kvcaches = [object(), object()]
+    connector.kv_cache_pointers_on_gpu = object()
+    request_batch = SimpleNamespace(register=Mock())
+    chunks = (torch.tensor([0]), torch.tensor([1]))
+
+    with patch.object(torch.cuda, "current_stream", return_value=object()):
+        generator = connector._batched_from_gpu_grouped_layers(
+            memory_objs=[[object()], [object()]],
+            slot_mapping=None,
+            slot_mapping_chunks=chunks,
+            tmp_gpu_buffer_tensors=[],
+            reservation=Mock(),
+            dependency_claim=None,
+            group_size=2,
+            request_batch=request_batch,
+            req_id="req",
+        )
+        next(generator)
+        generator.close()
+
+    entry = request_batch.register.call_args.args[0]
+    assert entry.slot_mapping_chunks is chunks
+
+
 def test_layerwise_gpu_buffer_lazy_initialization_is_serialized():
     connector = object.__new__(VLLMPagedMemLayerwiseGPUConnector)
     connector.use_gpu = True
     connector.gpu_buffer_allocator = None
+    connector.kv_cache_pointers_on_gpu = object()
+    connector.tokens_per_layer = 8
+    connector.elements_per_layer = 16
     connector._gpu_buffer_init_lock = threading.Lock()
     connector.layout_hints = {}
     connector.element_size = 2
