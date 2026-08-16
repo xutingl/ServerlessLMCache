@@ -1604,6 +1604,12 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         offset = starts[0]
         current_stream = torch.cuda.current_stream()
+        # slot_mapping_full is produced on the current vLLM stream, but the
+        # transfer kernel consumes it on load_stream. Establish that dependency
+        # explicitly; otherwise a fast decode graph can let the load kernel read
+        # the mapping before torch.cat has finished populating it.
+        self.load_stream.wait_stream(current_stream)
+        slot_mapping_full.record_stream(self.load_stream)
 
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
