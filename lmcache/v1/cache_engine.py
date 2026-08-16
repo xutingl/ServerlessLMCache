@@ -1985,6 +1985,8 @@ class LMCacheEngine:
         to_gpu_send_time = 0.0
         final_yield_wait = 0.0
         final_sync_time = 0.0
+        to_count_down: list[MemoryObj] = []
+        to_release: list[tuple[CacheEngineKey, MemoryObj]] = []
 
         if keys:
             # Transpose the keys into layer major format
@@ -2017,8 +2019,6 @@ class LMCacheEngine:
             io_time = 0.0
             tot_kv_size = 0
 
-            to_count_down = []
-            to_release = []
             for layer_id in range(self.num_layers):
                 layer_start = time.perf_counter()
                 t_io = time.perf_counter()
@@ -2077,10 +2077,6 @@ class LMCacheEngine:
                         (time.perf_counter() - layer_start) * 1000,
                     )
 
-            for key, mem_obj in to_release:
-                if self.remove_after_retrieve and not self._is_passive():
-                    self.storage_manager.remove(key, self.retrieve_locations)
-                mem_obj.ref_count_down()
         else:
             t_start = time.perf_counter()
             io_time = 0.0
@@ -2099,8 +2095,17 @@ class LMCacheEngine:
         next(mem_obj_consumer)
         final_sync_time = time.perf_counter() - final_sync_start
 
-        # Unpin any disk-loaded staging objects now that the device-side sync
-        # has been enqueued (mem_obj_consumer advanced past its sync point).
+        # The layerwise GPU connector copies from these CPU objects on an
+        # asynchronous load stream. Keep their allocator references alive until
+        # the connector has synchronized that stream; otherwise another request
+        # can reuse the receive-buffer ranges while H2D is still in flight.
+        for key, mem_obj in to_release:
+            if self.remove_after_retrieve and not self._is_passive():
+                self.storage_manager.remove(key, self.retrieve_locations)
+            mem_obj.ref_count_down()
+
+        # Unpin any disk-loaded staging objects now that the device-side copy
+        # has completed (mem_obj_consumer advanced past its sync point).
         # Without this, pin_count stays at 1 forever and the CPU staging pool
         # fills up, causing the next retrieve to deadlock inside allocate().
         for mem_obj in to_count_down:

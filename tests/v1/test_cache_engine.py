@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from concurrent.futures import Future
 from copy import deepcopy
 import os
 import random
@@ -14,10 +15,11 @@ import torch
 
 # First Party
 from lmcache.utils import (
+    CacheEngineKey,
     mock_up_broadcast_fn,
     mock_up_broadcast_object_fn,
 )
-from lmcache.v1.cache_engine import LMCacheEngineBuilder
+from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventStatus, EventType
 
@@ -49,6 +51,74 @@ def get_expected_count(token_len, save_unfull_chunk, chunk_size):
     if save_unfull_chunk:
         return token_len
     return (token_len // chunk_size) * chunk_size
+
+
+def test_layerwise_retrieve_releases_objects_after_gpu_sync(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        "lmcache.v1.cache_engine.assert_layerwise_gpu_connector",
+        lambda connector: None,
+    )
+
+    class MemoryObj:
+        is_pinned = False
+
+        def get_size(self):
+            return 16
+
+        def ref_count_down(self):
+            events.append("release")
+
+    memory_obj = MemoryObj()
+
+    class TokenDatabase:
+        def process_tokens(self, **kwargs):
+            del kwargs
+            yield 0, 2, CacheEngineKey("model", 1, 0, 1, torch.float16)
+
+    class StorageManager:
+        def contains(self, key, locations):
+            del key, locations
+            return "PDBackend"
+
+        def layerwise_batched_get(self, keys, location=None):
+            del keys, location
+            future = Future()
+            future.set_result([memory_obj])
+            yield future
+
+    class GPUConnector:
+        def batched_to_gpu(self, starts, ends, **kwargs):
+            del starts, ends, kwargs
+            yield
+            _ = yield
+            events.append("gpu_sync")
+            yield
+
+    class StatsMonitor:
+        def on_retrieve_request(self, num_tokens):
+            return num_tokens
+
+        def on_retrieve_finished(self, request_id, num_tokens):
+            del request_id, num_tokens
+
+    engine = object.__new__(LMCacheEngine)
+    engine.storage_manager = StorageManager()
+    engine.gpu_connector = GPUConnector()
+    engine.token_database = TokenDatabase()
+    engine.stats_monitor = StatsMonitor()
+    engine.num_layers = 1
+    engine.retrieve_locations = ["PDBackend"]
+    engine.remove_after_retrieve = False
+    engine.is_healthy = lambda: True
+    engine._is_passive = lambda: False
+
+    retriever = engine.retrieve_layer([1, 2])
+    next(retriever)
+    next(retriever)
+    assert events == []
+    next(retriever)
+    assert events == ["gpu_sync", "release"]
 
 
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
