@@ -5,7 +5,7 @@ import os
 import statistics
 import threading
 import time
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 # Third Party
 import torch
@@ -1265,7 +1265,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         )
 
         self.gpu_buffer_allocator = None
-        self._gpu_buffer_init_lock = threading.Lock()
 
         assert "chunk_size" in kwargs, (
             "chunk_size should be provided to create a GPU buffer."
@@ -1357,68 +1356,53 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             layout_hints=layout_hints,
         )
 
-    def _lazy_initialize_buffer(
-        self,
-        kv_caches,
-        *,
-        allocate_gpu_buffer: bool = True,
-    ):
-        """Lazily initialize KV metadata and the optional generic GPU pool.
-
-        Shared request batches own exact-sized GPU buffers and only need the
-        metadata. Load and fallback store paths additionally allocate the pool.
-        """
-        if not self.use_gpu or (
-            self.kv_cache_pointers_on_gpu is not None
-            and (self.gpu_buffer_allocator is not None or not allocate_gpu_buffer)
-        ):
+    def initialize_gpu_buffer(self, kv_caches: List[torch.Tensor]) -> None:
+        """Reserve the reusable GPU staging pool during engine initialization."""
+        if not self.use_gpu or self.gpu_buffer_allocator is not None:
             return
 
-        with self._gpu_buffer_init_lock:
-            if self.kv_cache_pointers_on_gpu is None:
-                logger.info("Lazily initializing GPU connector metadata.")
-                kv_caches = ensure_contiguous_kv_caches(
-                    kv_caches, kv_layout=self.layout_hints.get("kv_layout")
-                )
-                self.kvcaches = kv_caches
-                self.gpu_kv_format = discover_gpu_kv_format(
-                    kv_caches, EngineType.VLLM, layout_hints=self.layout_hints
-                )
-                assert_is_vllm_flash_attn_or_flash_infer(self.gpu_kv_format)
-                self.tokens_per_layer = get_tokens_per_layer(
-                    kv_caches, self.gpu_kv_format
-                )
-                self.elements_per_layer = get_elements_per_layer(
-                    kv_caches, self.gpu_kv_format
-                )
-                self.num_blocks = get_num_blocks(kv_caches, self.gpu_kv_format)
-                self.block_size = get_block_size(kv_caches, self.gpu_kv_format)
-                self.page_buffer_size = self.num_blocks * self.block_size
-                self.head_size = get_head_size(kv_caches, self.gpu_kv_format)
-                self.kv_cache_pointers.numpy()[:] = [
-                    tensor.data_ptr() for tensor in kv_caches
-                ]
-                self.kv_cache_pointers_on_gpu = torch.empty(
-                    self.num_layers, dtype=torch.int64, device=self.device
-                )
-                self.kv_cache_pointers_on_gpu.copy_(self.kv_cache_pointers)
+        kv_caches = ensure_contiguous_kv_caches(
+            kv_caches, kv_layout=self.layout_hints.get("kv_layout")
+        )
+        self.kvcaches = kv_caches
+        self.gpu_kv_format = discover_gpu_kv_format(
+            kv_caches, EngineType.VLLM, layout_hints=self.layout_hints
+        )
+        assert_is_vllm_flash_attn_or_flash_infer(self.gpu_kv_format)
+        self.tokens_per_layer = get_tokens_per_layer(kv_caches, self.gpu_kv_format)
+        self.elements_per_layer = get_elements_per_layer(
+            kv_caches, self.gpu_kv_format
+        )
+        self.num_blocks = get_num_blocks(kv_caches, self.gpu_kv_format)
+        self.block_size = get_block_size(kv_caches, self.gpu_kv_format)
+        self.page_buffer_size = self.num_blocks * self.block_size
+        self.head_size = get_head_size(kv_caches, self.gpu_kv_format)
+        self.kv_cache_pointers.numpy()[:] = [tensor.data_ptr() for tensor in kv_caches]
+        self.kv_cache_pointers_on_gpu = torch.empty(
+            self.num_layers, dtype=torch.int64, device=self.device
+        )
+        self.kv_cache_pointers_on_gpu.copy_(self.kv_cache_pointers)
 
-            if not allocate_gpu_buffer or self.gpu_buffer_allocator is not None:
-                return
-            # The generic load/fallback path needs a pool sized for the full
-            # vLLM KV capacity. Shared request batches own exact-sized buffers.
-            logger.info(
-                "Lazily initializing GPU buffer "
-                f"(max tokens={self.tokens_per_layer}, "
-                f"store_streams={self.layerwise_store_stream_count})."
-            )
-            gpu_buffer_size = (
-                self.elements_per_layer
-                * self.element_size
-                * self.layerwise_store_stream_count
-            )
-            self.gpu_buffer_allocator = GPUMemoryAllocator(
-                gpu_buffer_size, device=self.device
+        gpu_buffer_size = (
+            self.elements_per_layer
+            * self.element_size
+            * self.layerwise_store_stream_count
+        )
+        logger.info(
+            "Initializing reusable GPU staging pool during KV cache registration "
+            "(max_tokens=%d, store_streams=%d, size_bytes=%d).",
+            self.tokens_per_layer,
+            self.layerwise_store_stream_count,
+            gpu_buffer_size,
+        )
+        self.gpu_buffer_allocator = GPUMemoryAllocator(
+            gpu_buffer_size, device=self.device
+        )
+
+    def _require_gpu_buffer(self) -> None:
+        if self.use_gpu and self.gpu_buffer_allocator is None:
+            raise RuntimeError(
+                "GPU staging pool was not initialized during KV cache registration"
             )
 
     def _select_layerwise_store_stream(
@@ -1579,7 +1563,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
         sync: bool = kwargs["sync"]
 
-        self._lazy_initialize_buffer(self.kvcaches)
+        self._require_gpu_buffer()
 
         slot_mapping_chunks = []
         for start, end in zip(starts, ends, strict=False):
@@ -1635,6 +1619,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                             f"got {memory_obj.metadata.fmt}"
                         )
                     if self.use_gpu:
+                        assert tmp_gpu_buffer_obj is not None
+                        assert tmp_gpu_buffer_obj.tensor is not None
                         tmp_gpu_buffer_obj.tensor[start - offset : end - offset].copy_(
                             memory_obj.tensor, non_blocking=True
                         )
@@ -1649,6 +1635,8 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                         )
 
                 if self.use_gpu:
+                    assert tmp_gpu_buffer_obj is not None
+                    assert tmp_gpu_buffer_obj.tensor is not None
                     lmc_ops.single_layer_kv_transfer(
                         tmp_gpu_buffer_obj.tensor,
                         self.kvcaches[layer_id],
@@ -1751,13 +1739,7 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         )
 
         layerwise_request_batch = kwargs.get("layerwise_request_batch")
-        self._lazy_initialize_buffer(
-            self.kvcaches,
-            allocate_gpu_buffer=not isinstance(
-                layerwise_request_batch,
-                LayerwiseRequestBatch,
-            ),
-        )
+        self._require_gpu_buffer()
 
         slot_mapping_chunks = tuple(
             slot_mapping[start:end]

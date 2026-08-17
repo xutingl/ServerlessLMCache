@@ -144,34 +144,23 @@ def test_layerwise_request_batch_defers_slot_mapping_concat():
     assert entry.slot_mapping_chunks is chunks
 
 
-def test_layerwise_gpu_buffer_lazy_initialization_is_serialized():
+def test_layerwise_gpu_buffer_initializes_eagerly_once():
     connector = object.__new__(VLLMPagedMemLayerwiseGPUConnector)
     connector.use_gpu = True
     connector.gpu_buffer_allocator = None
-    connector.kv_cache_pointers_on_gpu = object()
-    connector.tokens_per_layer = 8
-    connector.elements_per_layer = 16
-    connector._gpu_buffer_init_lock = threading.Lock()
+    connector.kv_cache_pointers = torch.empty(2, dtype=torch.int64)
+    connector.kv_cache_pointers_on_gpu = None
+    connector.num_layers = 2
     connector.layout_hints = {}
     connector.element_size = 2
     connector.layerwise_store_stream_count = 2
     connector.device = "cuda"
 
-    allocator_calls = []
-    allocator_entered = threading.Event()
-    second_allocator_entered = threading.Event()
-    allow_allocator_return = threading.Event()
-
-    def fake_allocator(size, device):
-        allocator_calls.append((size, device))
-        if len(allocator_calls) == 2:
-            second_allocator_entered.set()
-        allocator_entered.set()
-        assert allow_allocator_return.wait(timeout=1)
-        return object()
-
-    def initialize():
-        connector._lazy_initialize_buffer([object()])
+    kv_caches = [Mock(), Mock()]
+    kv_caches[0].data_ptr.return_value = 100
+    kv_caches[1].data_ptr.return_value = 200
+    pointer_tensor = Mock()
+    allocator = Mock()
 
     with (
         patch(
@@ -195,25 +184,38 @@ def test_layerwise_gpu_buffer_lazy_initialization_is_serialized():
             return_value=16,
         ),
         patch(
-            "lmcache.v1.gpu_connector.gpu_connectors.GPUMemoryAllocator",
-            side_effect=fake_allocator,
+            "lmcache.v1.gpu_connector.gpu_connectors.get_num_blocks",
+            return_value=4,
         ),
+        patch(
+            "lmcache.v1.gpu_connector.gpu_connectors.get_block_size",
+            return_value=2,
+        ),
+        patch(
+            "lmcache.v1.gpu_connector.gpu_connectors.get_head_size",
+            return_value=1,
+        ),
+        patch(
+            "lmcache.v1.gpu_connector.gpu_connectors.GPUMemoryAllocator",
+            return_value=allocator,
+        ) as allocator_cls,
+        patch.object(torch, "empty", return_value=pointer_tensor),
     ):
-        first = threading.Thread(target=initialize)
-        second = threading.Thread(target=initialize)
-        first.start()
-        assert allocator_entered.wait(timeout=1)
-        second.start()
+        connector.initialize_gpu_buffer(kv_caches)
+        connector.initialize_gpu_buffer(kv_caches)
 
-        assert not second_allocator_entered.wait(timeout=0.1)
-        assert len(allocator_calls) == 1
-        allow_allocator_return.set()
-        first.join(timeout=1)
-        second.join(timeout=1)
+    allocator_cls.assert_called_once_with(64, device="cuda")
+    pointer_tensor.copy_.assert_called_once_with(connector.kv_cache_pointers)
+    assert connector.gpu_buffer_allocator is allocator
 
-    assert not first.is_alive()
-    assert not second.is_alive()
-    assert allocator_calls == [(64, "cuda")]
+
+def test_layerwise_gpu_transfer_requires_eager_buffer_initialization():
+    connector = object.__new__(VLLMPagedMemLayerwiseGPUConnector)
+    connector.use_gpu = True
+    connector.gpu_buffer_allocator = None
+
+    with pytest.raises(RuntimeError, match="during KV cache registration"):
+        connector._require_gpu_buffer()
 
 
 def test_fused_layerwise_destination_requires_contiguous_exact_allocations():
@@ -624,6 +626,7 @@ def test_layerwise_vllm_paged_connector_with_gpu(use_gpu, gpu_kv_format):
         dtype=dtype,
         device=device,
     )
+    connector.initialize_gpu_buffer(gpu_kv_src)
 
     # from gpu to cpu
     starts = []
@@ -732,6 +735,7 @@ def test_batched_layerwise_vllm_paged_connector_with_gpu(use_gpu):
         dtype=dtype,
         device=device,
     )
+    connector.initialize_gpu_buffer(gpu_kv_src)
 
     # from gpu to cpu
     starts_1 = []

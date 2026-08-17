@@ -194,6 +194,19 @@ class LMCacheManager:
             self._init_health_monitor()
             return
 
+        gpu_connector = self._lmcache_engine.gpu_connector
+        initialize_gpu_buffer = getattr(
+            gpu_connector,
+            "initialize_gpu_buffer",
+            None,
+        )
+        kv_caches = list(self.kv_caches.values())
+        if callable(initialize_gpu_buffer) and kv_caches:
+            # Reserve the transfer pool before the engine reports startup
+            # success. Allocation failures must not degrade into a live engine
+            # that crashes on its first save or retrieve.
+            initialize_gpu_buffer(kv_caches)
+
         try:
             # First Party
             from lmcache.v1.lookup_client.lmcache_async_lookup_client import (

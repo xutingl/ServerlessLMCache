@@ -228,6 +228,51 @@ class TestLMCacheManagerPostInit:
         # with async_lookup_server=None
         mock_engine.post_init.assert_called_once_with(async_lookup_server=None)
 
+    def test_post_init_initializes_gpu_buffer_before_engine(self):
+        config = LMCacheEngineConfig.from_defaults()
+        mock_engine = MagicMock()
+        mock_gpu_connector = MagicMock()
+        mock_engine.gpu_connector = mock_gpu_connector
+        calls = []
+        mock_gpu_connector.initialize_gpu_buffer.side_effect = (
+            lambda _: calls.append("gpu_buffer")
+        )
+        mock_engine.post_init.side_effect = lambda **_: calls.append("engine")
+        kv_cache = MagicMock()
+        connector = MagicMock()
+        connector.kv_caches = {"layer.0": kv_cache}
+        factory = _make_mock_factory(engine=mock_engine)
+        manager = LMCacheManager(
+            config=config,
+            service_factory=factory,
+            connector=connector,
+        )
+
+        manager.post_init()
+
+        mock_gpu_connector.initialize_gpu_buffer.assert_called_once_with([kv_cache])
+        assert calls == ["gpu_buffer", "engine"]
+
+    def test_post_init_propagates_gpu_buffer_allocation_failure(self):
+        config = LMCacheEngineConfig.from_defaults()
+        mock_engine = MagicMock()
+        mock_engine.gpu_connector.initialize_gpu_buffer.side_effect = RuntimeError(
+            "GPU staging allocation failed"
+        )
+        connector = MagicMock()
+        connector.kv_caches = {"layer.0": MagicMock()}
+        factory = _make_mock_factory(engine=mock_engine)
+        manager = LMCacheManager(
+            config=config,
+            service_factory=factory,
+            connector=connector,
+        )
+
+        with pytest.raises(RuntimeError, match="GPU staging allocation failed"):
+            manager.post_init()
+
+        mock_engine.post_init.assert_not_called()
+
     def test_post_init_with_engine_and_async_server(self):
         """Test post_init calls engine.post_init when async lookup server exists."""
         # First Party
