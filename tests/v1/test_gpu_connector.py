@@ -577,11 +577,14 @@ def test_vllm_paged_connector_v3_with_gpu_and_mla(use_gpu, num_groups, gpu_kv_fo
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS,  # vllm non-MLA flash infer
     ],
 )
+@pytest.mark.parametrize("load_slot_mapping_device", ["cpu", "cuda"])
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemLayerwiseGPUConnector",
 )
-def test_layerwise_vllm_paged_connector_with_gpu(use_gpu, gpu_kv_format):
+def test_layerwise_vllm_paged_connector_with_gpu(
+    use_gpu, gpu_kv_format, load_slot_mapping_device
+):
     num_blocks = 100
     block_size = 16
     num_layers = 32
@@ -667,7 +670,7 @@ def test_layerwise_vllm_paged_connector_with_gpu(use_gpu, gpu_kv_format):
         starts,
         ends,
         kvcaches=gpu_kv_dst,
-        slot_mapping=slot_mapping,
+        slot_mapping=slot_mapping.to(load_slot_mapping_device),
         sync=True,
     )
     next(mem_obj_consumer)

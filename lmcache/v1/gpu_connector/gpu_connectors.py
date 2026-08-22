@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 import abc
+from contextlib import nullcontext
 import os
 import statistics
 import threading
@@ -1565,12 +1566,32 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
 
         self._require_gpu_buffer()
 
-        slot_mapping_chunks = []
-        for start, end in zip(starts, ends, strict=False):
-            slot_mapping_chunks.append(slot_mapping[start:end])
+        current_stream = torch.cuda.current_stream()
+        # Layerwise retrieval keeps the mapping on CPU until this point so its
+        # H2D copy and consumers belong to load_stream, without importing
+        # unrelated queued vLLM work through wait_stream().
+        slot_mapping_host = slot_mapping if slot_mapping.device.type == "cpu" else None
+        mapping_stream = (
+            torch.cuda.stream(self.load_stream)
+            if slot_mapping_host is not None
+            else nullcontext()
+        )
+        with mapping_stream:
+            if slot_mapping_host is not None:
+                slot_mapping = slot_mapping_host.to(self.device, non_blocking=True)
+            slot_mapping_full = torch.cat(
+                [
+                    slot_mapping[start:end]
+                    for start, end in zip(starts, ends, strict=False)
+                ],
+                dim=0,
+            )
 
-        # TODO(Jiayi): Optimize away this `cat`
-        slot_mapping_full = torch.cat(slot_mapping_chunks, dim=0)
+        if slot_mapping_host is None:
+            # GPU mappings may have been produced on the current vLLM stream.
+            # Preserve the dependency for callers that still pass one directly.
+            self.load_stream.wait_stream(current_stream)
+        slot_mapping_full.record_stream(self.load_stream)
 
         num_tokens = len(slot_mapping_full)
 
@@ -1587,14 +1608,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
             assert tmp_gpu_buffer_obj.tensor is not None
 
         offset = starts[0]
-        current_stream = torch.cuda.current_stream()
-        # slot_mapping_full is produced on the current vLLM stream, but the
-        # transfer kernel consumes it on load_stream. Establish that dependency
-        # explicitly; otherwise a fast decode graph can let the load kernel read
-        # the mapping before torch.cat has finished populating it.
-        self.load_stream.wait_stream(current_stream)
-        slot_mapping_full.record_stream(self.load_stream)
-
         for layer_id in range(self.num_layers):
             memory_objs_layer = yield
             if sync:
