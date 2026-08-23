@@ -34,7 +34,10 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
-from lmcache.request_metrics_bridge import log_lmcache_count_metric
+from lmcache.request_metrics_bridge import (
+    log_lmcache_count_metric,
+    log_lmcache_duration_series_metric,
+)
 from lmcache.usage_context import InitializeUsageContext
 from lmcache.utils import (
     CacheEngineKey,
@@ -2115,6 +2118,23 @@ class LMCacheEngine:
         wall_time = time.perf_counter() - t_start
         retrieved_tokens = torch.sum(ret_mask)
         log_lmcache_count_metric(req_id, "LmcacheRetrievedTokens", retrieved_tokens)
+        if keys:
+            # Fixed order: contains, submit, yield/resume, result wait,
+            # to-GPU send, final yield, final sync, and total wall time.
+            log_lmcache_duration_series_metric(
+                req_id,
+                "LmcacheLayerwiseLoadBreakdown",
+                (
+                    contains_time,
+                    submit_time,
+                    yield_resume_time,
+                    result_wait_time,
+                    to_gpu_send_time,
+                    final_yield_wait,
+                    final_sync_time,
+                    wall_time,
+                ),
+            )
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
         if not self._is_passive():
             logger.info(

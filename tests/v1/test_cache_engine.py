@@ -55,9 +55,14 @@ def get_expected_count(token_len, save_unfull_chunk, chunk_size):
 
 def test_layerwise_retrieve_releases_objects_after_gpu_sync(monkeypatch):
     events = []
+    load_breakdowns = []
     monkeypatch.setattr(
         "lmcache.v1.cache_engine.assert_layerwise_gpu_connector",
         lambda connector: None,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.cache_engine.log_lmcache_duration_series_metric",
+        lambda rid, name, values: load_breakdowns.append((rid, name, values)),
     )
 
     class MemoryObj:
@@ -119,6 +124,9 @@ def test_layerwise_retrieve_releases_objects_after_gpu_sync(monkeypatch):
     assert events == []
     next(retriever)
     assert events == ["gpu_sync", "release"]
+    assert len(load_breakdowns) == 1
+    assert load_breakdowns[0][1] == "LmcacheLayerwiseLoadBreakdown"
+    assert len(load_breakdowns[0][2]) == 8
 
 
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
