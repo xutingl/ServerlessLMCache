@@ -162,6 +162,52 @@ class _LayerwiseStoreBatchTask:
         self.abort = abort
 
 
+class _LayerwiseBatchViewAllocator:
+    """Release a shared staging owner after every carved view is done."""
+
+    def __init__(self, owner: TensorMemoryObj) -> None:
+        self._owner: Optional[TensorMemoryObj] = owner
+        self._remaining = 0
+        self._sealed = False
+        self._lock = threading.Lock()
+
+    def register_views(self, view_count: int) -> None:
+        if view_count <= 0:
+            raise ValueError("view_count must be positive")
+        with self._lock:
+            if self._sealed:
+                raise RuntimeError("cannot register views after sealing the batch")
+            self._remaining += view_count
+
+    def seal(self) -> None:
+        owner: Optional[TensorMemoryObj] = None
+        with self._lock:
+            if self._sealed:
+                return
+            self._sealed = True
+            if self._remaining == 0:
+                owner = self._owner
+                self._owner = None
+        if owner is not None:
+            owner.ref_count_down()
+
+    def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None) -> None:
+        del allocator_type
+        owner: Optional[TensorMemoryObj] = None
+        with self._lock:
+            if not memory_obj.is_valid():
+                return
+            if self._remaining == 0:
+                raise RuntimeError("layerwise batch has no live views")
+            memory_obj.invalidate()
+            self._remaining -= 1
+            if self._sealed and self._remaining == 0:
+                owner = self._owner
+                self._owner = None
+        if owner is not None:
+            owner.ref_count_down()
+
+
 class LayerwiseStoreBatch:
     """Submit one cache-engine task for a layer tile spanning requests."""
 
@@ -169,14 +215,103 @@ class LayerwiseStoreBatch:
         self,
         gpu_batch: LayerwiseRequestBatch,
         executor: ThreadPoolExecutor,
+        cpu_staging_owner: TensorMemoryObj,
+        token_capacity: int,
+        num_layers: int,
     ) -> None:
+        if token_capacity <= 0 or num_layers <= 0:
+            raise ValueError("layerwise staging dimensions must be positive")
+        cpu_staging = cpu_staging_owner.tensor
+        if (
+            cpu_staging is None
+            or cpu_staging.device.type != "cpu"
+            or not cpu_staging.is_contiguous()
+            or cpu_staging.shape[0] != num_layers
+        ):
+            raise ValueError(
+                "layerwise staging owner must be a contiguous CPU tensor"
+            )
+        per_layer_bytes = (
+            cpu_staging.numel() * cpu_staging.element_size() // num_layers
+        )
+        if per_layer_bytes % token_capacity != 0:
+            raise ValueError("layerwise staging size is not token aligned")
+
         self.gpu_batch = gpu_batch
         self.group_size = gpu_batch.group_size
         self._executor = executor
+        self._cpu_staging = cpu_staging
+        self._cpu_staging_bytes = cpu_staging.view(torch.uint8).reshape(
+            num_layers, -1
+        )
+        self._token_capacity = token_capacity
+        self._token_cursor = 0
+        self._num_layers = num_layers
+        self._bytes_per_token = per_layer_bytes // token_capacity
+        self._staging_lock = threading.Lock()
+        self._view_allocator = _LayerwiseBatchViewAllocator(cpu_staging_owner)
+        self.gpu_batch.cpu_staging = cpu_staging
+        self.gpu_batch.cpu_staging_token_capacity = token_capacity
         self._lock = threading.Lock()
         self._pending: list[_LayerwiseStoreBatchTask] = []
         self._pending_completion: Future[None] = Future()
         self._error: Optional[BaseException] = None
+
+    def allocate_memory_objs(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        num_tokens: int,
+        fmt: MemoryFormat,
+    ) -> list[MemoryObj]:
+        """Carve one chunk's per-layer views from the shared CPU owner."""
+
+        if num_tokens <= 0:
+            raise ValueError("layerwise chunk must contain at least one token")
+        logical_bytes = shape.numel() * dtype.itemsize
+        if logical_bytes != num_tokens * self._bytes_per_token:
+            raise ValueError(
+                "layerwise chunk shape does not match the staging layout"
+            )
+
+        with self._staging_lock:
+            token_end = self._token_cursor + num_tokens
+            if token_end > self._token_capacity:
+                raise RuntimeError(
+                    "layerwise request batch exceeded its token capacity: "
+                    f"{token_end} > {self._token_capacity}"
+            )
+            byte_start = self._token_cursor * self._bytes_per_token
+            byte_end = token_end * self._bytes_per_token
+            raw_views = self._cpu_staging_bytes[:, byte_start:byte_end].unbind(0)
+            memory_objs = [
+                TensorMemoryObj(
+                    raw_data=raw_view,
+                    metadata=MemoryObjMetadata(
+                        shape=shape,
+                        dtype=dtype,
+                        address=0,
+                        phy_size=logical_bytes,
+                        ref_count=1,
+                        pin_count=0,
+                        fmt=fmt,
+                        shapes=[shape],
+                        dtypes=[dtype],
+                    ),
+                    parent_allocator=None,
+                )
+                for raw_view in raw_views
+            ]
+            self._view_allocator.register_views(len(memory_objs))
+            for memory_obj in memory_objs:
+                memory_obj.meta.address = memory_obj.raw_data.data_ptr()
+                memory_obj.parent_allocator = self._view_allocator
+            self._token_cursor = token_end
+            self.gpu_batch.cpu_staging_tokens = token_end
+            return memory_objs
+
+    def _seal_cpu_staging(self) -> None:
+        self._view_allocator.seal()
 
     def register_put_task(self, task: _LayerwiseStoreBatchTask) -> Future[None]:
         with self._lock:
@@ -242,6 +377,7 @@ class LayerwiseStoreBatch:
             raise RuntimeError("layerwise store batch is aborted") from error
 
         try:
+            self._seal_cpu_staging()
             entry_count = self.gpu_batch.flush()
             if entry_count != len(tasks):
                 raise RuntimeError(
@@ -271,6 +407,7 @@ class LayerwiseStoreBatch:
             completion = self._pending_completion
             self._pending = []
             self._pending_completion = Future()
+        self._seal_cpu_staging()
         self.gpu_batch.abort(error)
         self._abort_tasks(tasks)
         if tasks and not completion.done():
@@ -832,7 +969,12 @@ class LMCacheEngine:
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
-    def create_layerwise_store_batch(self, total_tokens: int) -> LayerwiseStoreBatch:
+    def create_layerwise_store_batch(
+        self,
+        total_tokens: int,
+        *,
+        has_multi_chunk_request: bool = False,
+    ) -> LayerwiseStoreBatch:
         """Create a layer-major GPU and put batch for one scheduler forward."""
 
         if self.gpu_connector is None or self._layerwise_put_executor is None:
@@ -846,10 +988,35 @@ class LMCacheEngine:
             raise RuntimeError(
                 "GPU connector does not support layerwise request batches"
             )
-        return LayerwiseStoreBatch(
-            create_gpu_batch(total_tokens),
-            self._layerwise_put_executor,
+        owner_shape = torch.Size(
+            [self.num_layers, *self.gpu_connector.get_shape(total_tokens)]
         )
+        owner = self.storage_manager.allocate(
+            owner_shape,
+            self.metadata.kv_dtype,
+            fmt=self.fmt,
+            busy_loop=False,
+        )
+        if owner is None:
+            raise RuntimeError("failed to allocate layerwise request batch staging")
+        if not isinstance(owner, TensorMemoryObj):
+            owner.ref_count_down()
+            raise TypeError("layerwise request batch requires TensorMemoryObj staging")
+        try:
+            gpu_batch = create_gpu_batch(
+                total_tokens,
+                has_multi_chunk_request=has_multi_chunk_request,
+            )
+            return LayerwiseStoreBatch(
+                gpu_batch,
+                self._layerwise_put_executor,
+                owner,
+                total_tokens,
+                self.num_layers,
+            )
+        except BaseException:
+            owner.ref_count_down()
+            raise
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -1092,13 +1259,23 @@ class LMCacheEngine:
             kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
 
             allocation_start = time.perf_counter()
-            memory_objs_multi_layer = self.storage_manager.batched_allocate(
-                kv_shape_single_layer,
-                kv_dtype,
-                batch_size=self.num_layers,
-                fmt=self.fmt,
-                busy_loop=self.config.get_extra_config_value("force_store_wait", False),
-            )
+            if isinstance(layerwise_store_batch, LayerwiseStoreBatch):
+                memory_objs_multi_layer = layerwise_store_batch.allocate_memory_objs(
+                    kv_shape_single_layer,
+                    kv_dtype,
+                    num_tokens,
+                    self.fmt,
+                )
+            else:
+                memory_objs_multi_layer = self.storage_manager.batched_allocate(
+                    kv_shape_single_layer,
+                    kv_dtype,
+                    batch_size=self.num_layers,
+                    fmt=self.fmt,
+                    busy_loop=self.config.get_extra_config_value(
+                        "force_store_wait", False
+                    ),
+                )
             allocation_time += time.perf_counter() - allocation_start
 
             if memory_objs_multi_layer is None:
@@ -1665,53 +1842,54 @@ class LMCacheEngine:
                     f"other_ms={pipeline_other_time * 1000:.4f}"
                 ),
             )
-            logger.info(
-                "[req_id=%s] Stored %d out of total %d tokens. "
-                "size: %.4f GB, cost %.4f ms, "
-                "io_time %.4f ms, gpu_offload_step_time %.4f ms, "
-                "put_ready_wait_time %.4f ms, put_submit_time %.4f ms, "
-                "put_future_wait_time %.4f ms, wall_time %.4f ms, "
-                "throughput: %.4f GB/s",
-                req_id,
-                tot_token_num,
-                len(tokens),
-                tot_kv_size / 1024**3,
-                io_time * 1000,
-                io_time * 1000,
-                gpu_offload_step_time * 1000,
-                put_ready_wait_time * 1000,
-                put_submit_time * 1000,
-                put_future_wait_time * 1000,
-                wall_time * 1000,
-                tot_kv_size / io_time / 1024**3 if io_time > 0 else 0,
-            )
-            logger.info(
-                "[req_id=%s] Layerwise store pipeline breakdown: "
-                "chunks=%d, prepare_time=%.4f ms, contains_time=%.4f ms, "
-                "allocation_time=%.4f ms, prepare_other_time=%.4f ms, "
-                "remote_prepare_layers=%d, remote_prepare_submit_time=%.4f ms, "
-                "yield_resume_time=%.4f ms, put_ready_wait_time=%.4f ms, "
-                "put_submit_time=%.4f ms, put_future_wait_time=%.4f ms, "
-                "put_task_wall_time=%.4f ms, block_lease_release_time=%.4f ms, "
-                "pipeline_other_time=%.4f ms, "
-                "total_time=%.4f ms",
-                req_id,
-                len(starts),
-                prepare_time * 1000,
-                contains_time * 1000,
-                allocation_time * 1000,
-                prepare_other_time * 1000,
-                remote_prepare_layers,
-                remote_prepare_submit_time * 1000,
-                yield_resume_time * 1000,
-                put_ready_wait_time * 1000,
-                put_submit_time * 1000,
-                put_future_wait_time * 1000,
-                put_task_wall_time * 1000,
-                block_lease_release_time * 1000,
-                pipeline_other_time * 1000,
-                (wall_end - prepare_start) * 1000,
-            )
+            if store_timeline_enabled:
+                logger.info(
+                    "[req_id=%s] Stored %d out of total %d tokens. "
+                    "size: %.4f GB, cost %.4f ms, "
+                    "io_time %.4f ms, gpu_offload_step_time %.4f ms, "
+                    "put_ready_wait_time %.4f ms, put_submit_time %.4f ms, "
+                    "put_future_wait_time %.4f ms, wall_time %.4f ms, "
+                    "throughput: %.4f GB/s",
+                    req_id,
+                    tot_token_num,
+                    len(tokens),
+                    tot_kv_size / 1024**3,
+                    io_time * 1000,
+                    io_time * 1000,
+                    gpu_offload_step_time * 1000,
+                    put_ready_wait_time * 1000,
+                    put_submit_time * 1000,
+                    put_future_wait_time * 1000,
+                    wall_time * 1000,
+                    tot_kv_size / io_time / 1024**3 if io_time > 0 else 0,
+                )
+                logger.info(
+                    "[req_id=%s] Layerwise store pipeline breakdown: "
+                    "chunks=%d, prepare_time=%.4f ms, contains_time=%.4f ms, "
+                    "allocation_time=%.4f ms, prepare_other_time=%.4f ms, "
+                    "remote_prepare_layers=%d, remote_prepare_submit_time=%.4f ms, "
+                    "yield_resume_time=%.4f ms, put_ready_wait_time=%.4f ms, "
+                    "put_submit_time=%.4f ms, put_future_wait_time=%.4f ms, "
+                    "put_task_wall_time=%.4f ms, block_lease_release_time=%.4f ms, "
+                    "pipeline_other_time=%.4f ms, "
+                    "total_time=%.4f ms",
+                    req_id,
+                    len(starts),
+                    prepare_time * 1000,
+                    contains_time * 1000,
+                    allocation_time * 1000,
+                    prepare_other_time * 1000,
+                    remote_prepare_layers,
+                    remote_prepare_submit_time * 1000,
+                    yield_resume_time * 1000,
+                    put_ready_wait_time * 1000,
+                    put_submit_time * 1000,
+                    put_future_wait_time * 1000,
+                    put_task_wall_time * 1000,
+                    block_lease_release_time * 1000,
+                    pipeline_other_time * 1000,
+                    (wall_end - prepare_start) * 1000,
+                )
         else:
             release_remaining_block_leases("no_keys")
             # If no cache are found, we still need to yield to avoid

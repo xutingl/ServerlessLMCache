@@ -183,32 +183,41 @@ class TcpSocketChannel(PySocketChannel):
 
         remote_indexes = list(transfer_spec["remote_indexes"])
         remote_capacities = list(transfer_spec["remote_capacities"])
-        payloads = [_memory_obj_to_buffer(obj) for obj in objects]
-        if len(remote_indexes) != len(payloads):
+        if len(remote_indexes) != len(objects):
             raise ValueError(
                 "remote_indexes length must match objects length: "
-                f"{len(remote_indexes)} != {len(payloads)}"
+                f"{len(remote_indexes)} != {len(objects)}"
             )
-        if len(remote_capacities) != len(payloads):
+        if len(remote_capacities) != len(objects):
             raise ValueError(
                 "remote_capacities length must match objects length: "
-                f"{len(remote_capacities)} != {len(payloads)}"
+                f"{len(remote_capacities)} != {len(objects)}"
             )
 
         write_id = self._allocate_write_id()
         if self._native_sender_library is not None:
             sender = self._get_native_data_sender()
+            addresses: list[int] = []
+            payload_sizes: list[int] = []
+            for obj in objects:
+                address, payload_size = _memory_obj_address_and_size(obj)
+                addresses.append(address)
+                payload_sizes.append(payload_size)
+            # The PD backend holds every MemoryObj until this synchronous call
+            # returns; Rust also waits for libzmq to release every payload.
             return int(
-                sender.batched_write(
+                sender.batched_write_from_addresses(
                     receiver_data_url,
                     str(transfer_spec.get("req_id") or ""),
                     write_id,
                     remote_indexes,
                     remote_capacities,
-                    payloads,
+                    addresses,
+                    payload_sizes,
                 )
             )
 
+        payloads = [_memory_obj_to_buffer(obj) for obj in objects]
         socket = self._get_data_socket(receiver_data_url)
         try:
             header = TcpSocketWriteHeader(
@@ -795,6 +804,31 @@ def _memory_obj_to_buffer(obj: Union[bytes, MemoryObj]) -> memoryview:
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
     return memoryview(tensor.view(torch.uint8).reshape(-1).numpy())
+
+
+def _memory_obj_address_and_size(
+    obj: Union[bytes, MemoryObj],
+) -> tuple[int, int]:
+    if not isinstance(obj, MemoryObj):
+        raise ValueError("Native TCP sender requires MemoryObj inputs")
+    raw_data = getattr(obj, "raw_data", None)
+    if (
+        not isinstance(raw_data, torch.Tensor)
+        or raw_data.device.type != "cpu"
+        or not raw_data.is_contiguous()
+    ):
+        raise ValueError(
+            "Native TCP sender requires contiguous CPU tensor-backed MemoryObj"
+        )
+    logical_size = obj.get_size()
+    if (
+        logical_size <= 0
+        or logical_size > raw_data.numel() * raw_data.element_size()
+    ):
+        raise ValueError(
+            "MemoryObj logical size must fit its non-empty raw tensor buffer"
+        )
+    return raw_data.data_ptr(), logical_size
 
 
 def _elapsed_ms(start: float) -> float:

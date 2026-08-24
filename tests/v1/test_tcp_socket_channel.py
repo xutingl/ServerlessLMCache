@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import threading
 import time
 import unittest
 
+import torch
 import zmq
 
+from lmcache.v1.memory_management import (
+    MemoryFormat,
+    MemoryObjMetadata,
+    TensorMemoryObj,
+)
 from lmcache.v1.transfer_channel.tcp_socket_channel import (
     TcpSocketChannel,
     TcpSocketChunkHeader,
@@ -40,6 +47,76 @@ def _make_receiver(payload: bytes = b"data") -> tuple[TcpSocketChannel, bytearra
 
 
 class TcpSocketChannelTest(unittest.TestCase):
+    def test_native_sender_uses_memory_object_addresses(self) -> None:
+        class Sender:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def batched_write_from_addresses(self, *args) -> int:
+                self.calls.append(args)
+                return 1
+
+        raw_data = torch.empty(16, dtype=torch.uint8)
+        memory_obj = TensorMemoryObj(
+            raw_data,
+            MemoryObjMetadata(
+                shape=torch.Size([8]),
+                dtype=torch.uint8,
+                address=raw_data.data_ptr(),
+                phy_size=16,
+                ref_count=1,
+                pin_count=0,
+                fmt=MemoryFormat.KV_T2D,
+                shapes=[torch.Size([8])],
+                dtypes=[torch.uint8],
+            ),
+            None,
+        )
+        sender = Sender()
+        channel = object.__new__(TcpSocketChannel)
+        channel._native_sender_library = "libzmq"
+        channel._next_write_id = 0
+        channel._next_write_id_lock = threading.Lock()
+        channel._get_native_data_sender = lambda: sender
+
+        written = channel.batched_write(
+            [memory_obj],
+            {
+                "receiver_data_url": "127.0.0.1:7500",
+                "remote_indexes": [4096],
+                "remote_capacities": [8],
+                "req_id": "request",
+            },
+        )
+
+        self.assertEqual(written, 1)
+        self.assertEqual(len(sender.calls), 1)
+        self.assertEqual(sender.calls[0][5], [raw_data.data_ptr()])
+        self.assertEqual(sender.calls[0][6], [8])
+
+    def test_native_sender_rejects_non_memory_objects(self) -> None:
+        class Sender:
+            def batched_write_from_addresses(self, *args) -> int:
+                return 1
+
+        sender = Sender()
+        channel = object.__new__(TcpSocketChannel)
+        channel._native_sender_library = "libzmq"
+        channel._next_write_id = 0
+        channel._next_write_id_lock = threading.Lock()
+        channel._get_native_data_sender = lambda: sender
+
+        with self.assertRaisesRegex(ValueError, "requires MemoryObj"):
+            channel.batched_write(
+                [b"payload"],
+                {
+                    "receiver_data_url": "127.0.0.1:7500",
+                    "remote_indexes": [4096],
+                    "remote_capacities": [16],
+                    "req_id": "request",
+                },
+            )
+
     def test_direct_receive_uses_byte_offset(self) -> None:
         channel, buffer = _make_receiver()
         header = TcpSocketWriteHeader(
