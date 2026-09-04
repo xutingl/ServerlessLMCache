@@ -3,6 +3,7 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+import os
 import random
 import threading
 
@@ -144,25 +145,39 @@ def test_layerwise_request_batch_defers_slot_mapping_concat():
     assert entry.slot_mapping_chunks is chunks
 
 
-def test_layerwise_gpu_buffer_initializes_eagerly_once():
+@pytest.mark.parametrize(
+    ("max_batched_tokens", "expected_size"),
+    [("4", 48), ("16", 96), ("0", 96)],
+)
+def test_layerwise_gpu_buffer_initializes_eagerly_once(
+    max_batched_tokens,
+    expected_size,
+):
     connector = object.__new__(VLLMPagedMemLayerwiseGPUConnector)
     connector.use_gpu = True
     connector.gpu_buffer_allocator = None
-    connector.kv_cache_pointers = torch.empty(2, dtype=torch.int64)
+    connector.kv_cache_pointers = torch.empty(3, dtype=torch.int64)
     connector.kv_cache_pointers_on_gpu = None
-    connector.num_layers = 2
+    connector.num_layers = 3
+    connector.hidden_dim_size = 1
+    connector.use_mla = False
     connector.layout_hints = {}
     connector.element_size = 2
     connector.layerwise_store_stream_count = 2
     connector.device = "cuda"
 
-    kv_caches = [Mock(), Mock()]
+    kv_caches = [Mock(), Mock(), Mock()]
     kv_caches[0].data_ptr.return_value = 100
     kv_caches[1].data_ptr.return_value = 200
+    kv_caches[2].data_ptr.return_value = 300
     pointer_tensor = Mock()
     allocator = Mock()
 
     with (
+        patch.dict(
+            os.environ,
+            {"MAX_NUM_BATCHED_TOKENS": max_batched_tokens},
+        ),
         patch(
             "lmcache.v1.gpu_connector.gpu_connectors.ensure_contiguous_kv_caches",
             side_effect=lambda value, **_: value,
@@ -178,10 +193,6 @@ def test_layerwise_gpu_buffer_initializes_eagerly_once():
         patch(
             "lmcache.v1.gpu_connector.gpu_connectors.get_tokens_per_layer",
             return_value=8,
-        ),
-        patch(
-            "lmcache.v1.gpu_connector.gpu_connectors.get_elements_per_layer",
-            return_value=16,
         ),
         patch(
             "lmcache.v1.gpu_connector.gpu_connectors.get_num_blocks",
@@ -204,7 +215,7 @@ def test_layerwise_gpu_buffer_initializes_eagerly_once():
         connector.initialize_gpu_buffer(kv_caches)
         connector.initialize_gpu_buffer(kv_caches)
 
-    allocator_cls.assert_called_once_with(64, device="cuda")
+    allocator_cls.assert_called_once_with(expected_size, device="cuda")
     pointer_tensor.copy_.assert_called_once_with(connector.kv_cache_pointers)
     assert connector.gpu_buffer_allocator is allocator
 

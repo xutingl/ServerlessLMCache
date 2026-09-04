@@ -1350,9 +1350,6 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         )
         assert_is_vllm_flash_attn_or_flash_infer(self.gpu_kv_format)
         self.tokens_per_layer = get_tokens_per_layer(kv_caches, self.gpu_kv_format)
-        self.elements_per_layer = get_elements_per_layer(
-            kv_caches, self.gpu_kv_format
-        )
         self.num_blocks = get_num_blocks(kv_caches, self.gpu_kv_format)
         self.block_size = get_block_size(kv_caches, self.gpu_kv_format)
         self.page_buffer_size = self.num_blocks * self.block_size
@@ -1363,15 +1360,28 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         )
         self.kv_cache_pointers_on_gpu.copy_(self.kv_cache_pointers)
 
+        max_batched_tokens = int(os.getenv("MAX_NUM_BATCHED_TOKENS", "8192"))
+        if max_batched_tokens <= 0:
+            max_batched_tokens = 8192
+        # One forward may fuse the scheduled tokens from multiple requests.
+        # Size by that work, not by every physical KV block owned by vLLM.
+        staging_token_capacity = min(self.tokens_per_layer, max_batched_tokens)
+        staging_layer_capacity = max(
+            self.num_layers,
+            self.layerwise_store_stream_count,
+        )
         gpu_buffer_size = (
-            self.elements_per_layer
+            self.get_shape(staging_token_capacity).numel()
             * self.element_size
-            * self.layerwise_store_stream_count
+            * staging_layer_capacity
         )
         logger.info(
             "Initializing reusable GPU staging pool during KV cache registration "
-            "(max_tokens=%d, store_streams=%d, size_bytes=%d).",
+            "(scheduled_token_capacity=%d, physical_token_capacity=%d, "
+            "layer_capacity=%d, store_streams=%d, size_bytes=%d).",
+            staging_token_capacity,
             self.tokens_per_layer,
+            staging_layer_capacity,
             self.layerwise_store_stream_count,
             gpu_buffer_size,
         )
